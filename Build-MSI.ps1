@@ -40,7 +40,7 @@ if([string]::IsNullOrWhiteSpace($wix)){
 }
 
 Write-Host "WiX: $wix" -ForegroundColor Cyan
-$out=Join-Path $msiDir "BackupS3Manager-v23.15-x64.msi"
+$out=Join-Path $msiDir "BackupS3Manager-v23.16-x64.msi"
 & (Join-Path $here "tools\New-WixHarvest.ps1") -SourceDirectory $app -OutputPath $harvest
 
 & $wix build $product $harvest `

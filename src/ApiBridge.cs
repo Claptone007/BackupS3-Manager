@@ -37,9 +37,13 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "23.15";
+    private const string CurrentVersion = "23.16";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
+    private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
+    private static readonly object UpdateDownloadLock = new();
+    private static JsonObject UpdateDownloadState = NewUpdateDownloadState();
+    private static Task? UpdateDownloadTask;
     private static readonly object AuditLock = new();
     private static readonly object HistoryLock = new();
     private JsonObject? _configCache;
@@ -70,7 +74,8 @@ internal sealed class ApiBridge
                     name = "BackupS3 Manager Desktop"
                 }),
                 ("GET", "/api/update/check") => await CheckForUpdateAsync(),
-                ("POST", "/api/update/download") => await DownloadUpdateAsync(),
+                ("POST", "/api/update/download") => await StartUpdateDownloadAsync(),
+                ("GET", "/api/update/progress") => GetUpdateDownloadProgress(),
 
                 ("GET", "/api/progress") => ReadJsonFile(AppPaths.ProgressPath,
                     """{"running":false,"current":0,"total":0,"percent":0,"database":"","phase":"IDLE","message":"Ожидание запуска","checked":[]}"""),
@@ -880,8 +885,25 @@ internal sealed class ApiBridge
         });
     }
 
-    private static async Task<ApiResponse> DownloadUpdateAsync()
+    private static JsonObject NewUpdateDownloadState() => new()
     {
+        ["status"] = "idle", ["running"] = false, ["downloadedBytes"] = 0L,
+        ["totalBytes"] = 0L, ["percent"] = 0, ["speedBytesPerSecond"] = 0L,
+        ["version"] = "", ["path"] = "", ["error"] = ""
+    };
+
+    private static ApiResponse GetUpdateDownloadProgress()
+    {
+        lock (UpdateDownloadLock) return ApiResponse.Json(200, UpdateDownloadState.DeepClone());
+    }
+
+    private static async Task<ApiResponse> StartUpdateDownloadAsync()
+    {
+        lock (UpdateDownloadLock)
+        {
+            if (UpdateDownloadTask is { IsCompleted: false })
+                return ApiResponse.Json(409, new { error = "Обновление уже скачивается." });
+        }
         var check = await CheckForUpdateAsync();
         if (check.StatusCode != 200) return check;
         var info = JsonNode.Parse(check.Body)?.AsObject();
@@ -896,14 +918,58 @@ internal sealed class ApiBridge
         var extension = Path.GetExtension(uri.AbsolutePath).Equals(".zip", StringComparison.OrdinalIgnoreCase) ? ".zip" : ".msi";
         var version = info["latestVersion"]?.ToString() ?? "update";
         var destination = Path.Combine(downloads, $"BackupS3Manager-v{version}-x64{extension}");
-        var bytes = await UpdateHttp.GetByteArrayAsync(uri);
         var expectedHash = info["sha256"]?.ToString()?.Trim();
-        var actualHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
-        if (!string.IsNullOrWhiteSpace(expectedHash) && !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("SHA-256 загруженного обновления не совпадает с manifest. Файл не сохранён.");
-        File.WriteAllBytes(destination, bytes);
-        AppLog.Info($"Обновление {version} загружено: {destination}");
-        return ApiResponse.Json(200, new { status = "downloaded", version, path = destination, sha256 = actualHash });
+        lock (UpdateDownloadLock)
+        {
+            UpdateDownloadState = NewUpdateDownloadState();
+            UpdateDownloadState["status"] = "starting";
+            UpdateDownloadState["running"] = true;
+            UpdateDownloadState["version"] = version;
+            UpdateDownloadState["path"] = destination;
+            UpdateDownloadTask = Task.Run(() => DownloadUpdateWorkerAsync(uri, destination, version, expectedHash));
+        }
+        return ApiResponse.Json(202, new { status = "started", version, path = destination });
+    }
+
+    private static async Task DownloadUpdateWorkerAsync(Uri uri, string destination, string version, string? expectedHash)
+    {
+        var partial = destination + ".part";
+        try
+        {
+            using var response = await UpdateDownloadHttp.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            var total = response.Content.Headers.ContentLength ?? 0L;
+            lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "downloading"; UpdateDownloadState["totalBytes"] = total; }
+            await using var input = await response.Content.ReadAsStreamAsync();
+            await using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true);
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            var buffer = new byte[1024 * 1024];
+            long downloaded = 0;
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            int read;
+            while ((read = await input.ReadAsync(buffer)) > 0)
+            {
+                await output.WriteAsync(buffer.AsMemory(0, read));
+                hash.AppendData(buffer, 0, read);
+                downloaded += read;
+                var speed = started.Elapsed.TotalSeconds > 0 ? (long)(downloaded / started.Elapsed.TotalSeconds) : 0L;
+                var percent = total > 0 ? (int)Math.Clamp(downloaded * 100L / total, 0, 100) : 0;
+                lock (UpdateDownloadLock) { UpdateDownloadState["downloadedBytes"] = downloaded; UpdateDownloadState["percent"] = percent; UpdateDownloadState["speedBytesPerSecond"] = speed; }
+            }
+            await output.FlushAsync();
+            var actualHash = Convert.ToHexString(hash.GetHashAndReset());
+            if (!string.IsNullOrWhiteSpace(expectedHash) && !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("SHA-256 загруженного обновления не совпадает с manifest.");
+            File.Move(partial, destination, true);
+            lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "completed"; UpdateDownloadState["running"] = false; UpdateDownloadState["percent"] = 100; UpdateDownloadState["sha256"] = actualHash; }
+            AppLog.Info($"Обновление {version} загружено: {destination}");
+        }
+        catch (Exception ex)
+        {
+            try { if (File.Exists(partial)) File.Delete(partial); } catch { }
+            lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "error"; UpdateDownloadState["running"] = false; UpdateDownloadState["error"] = ex.Message; }
+            AppLog.Error("Ошибка загрузки обновления", ex);
+        }
     }
 
     private static string NormalizeVersion(string value)

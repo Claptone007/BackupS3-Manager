@@ -88,7 +88,7 @@ foreach($needle in @('Where-Object {$null -eq $_.Enabled -or [bool]$_.Enabled}',
 $program = Get-Content (Join-Path $root "src\Program.cs") -Raw
 $splash = Get-Content (Join-Path $root "src\SplashForm.cs") -Raw
 if(-not $program.Contains('new SplashForm()')){throw "Animated startup splash is not launched"}
-foreach($needle in @('WaitForMinimumDisplayAsync','CreateRoundRectRgn','Backup','BACKUP MANAGER')){
+foreach($needle in @('WaitForMinimumDisplayAsync','CreateRoundRectRgn','BackupS3-Login.png','cyan loading pulse')){
     if(-not $splash.Contains($needle)){throw "Missing splash behavior: $needle"}
     Write-Host "[OK] startup splash: $needle"
 }

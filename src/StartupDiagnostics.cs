@@ -30,7 +30,7 @@ internal sealed class DiagnosticReport
     public string ToPlainText()
     {
         var sb = new StringBuilder();
-        sb.AppendLine("Backup S3 Manager v23.15 — диагностика");
+        sb.AppendLine("Backup S3 Manager v23.16 — диагностика");
         sb.AppendLine($"Время: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
         sb.AppendLine($"Computer: {Environment.MachineName}");
         sb.AppendLine($"User: {Environment.UserDomainName}\\{Environment.UserName}");

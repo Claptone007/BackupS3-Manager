@@ -1859,6 +1859,12 @@ html[data-theme="light"] #recentEventTooltip{
         border-left-color:#49aef0;
         color:#8ed5ff;
     }
+    .update-download-progress{margin-top:10px;padding:11px;border:1px solid #30404f;border-radius:8px;background:#0d141b}
+    .update-download-progress[hidden]{display:none}
+    .update-progress-head{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;color:#c8d8e6;font-size:11px}
+    .update-progress-track{height:9px;overflow:hidden;border-radius:999px;background:#202b35}
+    .update-progress-fill{width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,#248fd4,#48d69b);transition:width .25s ease}
+    .update-progress-details{margin-top:7px;color:#8299aa;font-size:10px}
 
 </style>
 <style>
@@ -2932,6 +2938,11 @@ html[data-theme="light"] #recentEventTooltip{
                     </div>
                     <label class="accent-field"><span>Канал обновлений GitHub</span><input id="settingUpdateManifestUrl" type="url" placeholder="https://github.com/…/releases/latest/download/manifest.json"></label>
                     <div id="updateCheckStatus" class="settings-inline-note">Нажмите «Проверить обновления».</div>
+                    <div id="updateDownloadProgress" class="update-download-progress" hidden>
+                        <div class="update-progress-head"><strong id="updateProgressTitle">Скачивание обновления</strong><span id="updateProgressPercent">0%</span></div>
+                        <div class="update-progress-track"><div id="updateProgressFill" class="update-progress-fill"></div></div>
+                        <div id="updateProgressDetails" class="update-progress-details">0 Б из 0 Б</div>
+                    </div>
                 </div>
 
                 <div class="settings-section">
@@ -4723,8 +4734,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingAutoStartBackground.checked=!!s.AutoStartInBackground;
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'23.15');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v23.15';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'23.16');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v23.16';});
 
         updateSettingsDangerState();
         return s;
@@ -4766,11 +4777,32 @@ html[data-theme="light"] #recentEventTooltip{
         finally{this.disabled=false;this.textContent=old;}
     });
     downloadUpdateButton.addEventListener('click',async function(){
-        const old=this.textContent;this.disabled=true;this.textContent='Скачиваю…';
+        const old=this.textContent;this.disabled=true;this.textContent='Скачивается…';
         try{
             const r=await fetch('/api/update/download',{method:'POST'});const data=await r.json();
             if(!r.ok)throw new Error(data.error||'Ошибка загрузки обновления');
-            await showAppDialog({title:'Обновление загружено',message:'Файл сохранён: '+data.path,kind:'info'});
+            const panel=document.getElementById('updateDownloadProgress');
+            const fill=document.getElementById('updateProgressFill');
+            const percentText=document.getElementById('updateProgressPercent');
+            const details=document.getElementById('updateProgressDetails');
+            const title=document.getElementById('updateProgressTitle');
+            const formatBytes=n=>{n=Number(n)||0;if(n>=1073741824)return (n/1073741824).toFixed(2)+' ГБ';if(n>=1048576)return (n/1048576).toFixed(1)+' МБ';if(n>=1024)return (n/1024).toFixed(1)+' КБ';return n+' Б';};
+            panel.hidden=false;fill.style.width='0%';percentText.textContent='0%';title.textContent='Скачивание BackupS3 v'+(data.version||'');
+            await new Promise((resolve,reject)=>{
+                const poll=async()=>{
+                    try{
+                        const pr=await fetch('/api/update/progress?t='+Date.now(),{cache:'no-store'});const p=await pr.json();
+                        if(!pr.ok)throw new Error(p.error||'Не удалось получить ход загрузки');
+                        const percent=Math.max(0,Math.min(100,Number(p.percent)||0));
+                        fill.style.width=percent+'%';percentText.textContent=percent+'%';
+                        details.textContent=formatBytes(p.downloadedBytes)+' из '+(p.totalBytes?formatBytes(p.totalBytes):'размер определяется')+(p.speedBytesPerSecond?' · '+formatBytes(p.speedBytesPerSecond)+'/с':'');
+                        if(p.status==='completed'){details.textContent='Готово: '+p.path;resolve(p);return;}
+                        if(p.status==='error'){reject(new Error(p.error||'Ошибка загрузки обновления'));return;}
+                        setTimeout(poll,500);
+                    }catch(e){reject(e);}
+                };poll();
+            });
+            await showAppDialog({title:'Обновление загружено',message:'Файл сохранён в папку «Загрузки». Можно закрыть BackupS3 и запустить установщик.',kind:'info'});
         }catch(e){await showAppDialog({title:'Ошибка обновления',message:e.message,kind:'error'});}
         finally{this.disabled=false;this.textContent=old;}
     });
