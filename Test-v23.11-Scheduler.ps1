@@ -21,9 +21,9 @@ if($api -match '(?m)^\s*Register-ScheduledTask\b'){
 }
 Write-Host "[OK] Register-ScheduledTask removed from desktop API" -ForegroundColor Green
 
-if($api -notmatch 'CurrentVersion\s*=\s*"23\.14"'){
-    throw "ApiBridge.cs version is not 23.14"
+if($api -notmatch 'CurrentVersion\s*=\s*"23\.15"'){
+    throw "ApiBridge.cs version is not 23.15"
 }
-Write-Host "[OK] desktop API version 23.14" -ForegroundColor Green
+Write-Host "[OK] desktop API version 23.15" -ForegroundColor Green
 
 Write-Host "v23.11 scheduler regression checks passed." -ForegroundColor Green

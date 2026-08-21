@@ -1838,6 +1838,28 @@ html[data-theme="light"] #recentEventTooltip{
         color:#526877;
     }
 
+    #updateCheckStatus.update-current{
+        border-left-color:#39c98a;
+        background:rgba(24,120,78,.16);
+        color:#74e0ad;
+    }
+    #updateCheckStatus.update-current::before{
+        content:"✓";
+        display:inline-grid;
+        place-items:center;
+        width:17px;
+        height:17px;
+        margin-right:7px;
+        border-radius:50%;
+        background:#23895f;
+        color:#fff;
+        font-weight:800;
+    }
+    #updateCheckStatus.update-available{
+        border-left-color:#49aef0;
+        color:#8ed5ff;
+    }
+
 </style>
 <style>
 
@@ -2909,7 +2931,7 @@ html[data-theme="light"] #recentEventTooltip{
                         </div>
                     </div>
                     <label class="accent-field"><span>Канал обновлений GitHub</span><input id="settingUpdateManifestUrl" type="url" placeholder="https://github.com/…/releases/latest/download/manifest.json"></label>
-                    <div id="updateCheckStatus" class="settings-inline-note">Адрес будет заполнен после публикации проекта в Replit.</div>
+                    <div id="updateCheckStatus" class="settings-inline-note">Нажмите «Проверить обновления».</div>
                 </div>
 
                 <div class="settings-section">
@@ -4701,8 +4723,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingAutoStartBackground.checked=!!s.AutoStartInBackground;
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'23.14');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v23.14';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'23.15');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v23.15';});
 
         updateSettingsDangerState();
         return s;
@@ -4738,8 +4760,9 @@ html[data-theme="light"] #recentEventTooltip{
             const data=await r.json();if(!r.ok)throw new Error(data.error||'Ошибка проверки обновлений');
             updateCheckStatus.textContent=data.message||'Проверка завершена.';
             updateCheckStatus.classList.toggle('update-available',!!data.updateAvailable);
+            updateCheckStatus.classList.toggle('update-current',!data.updateAvailable);
             downloadUpdateButton.hidden=!data.updateAvailable;
-        }catch(e){updateCheckStatus.textContent='Ошибка: '+e.message;}
+        }catch(e){updateCheckStatus.classList.remove('update-current','update-available');updateCheckStatus.textContent='Ошибка: '+e.message;}
         finally{this.disabled=false;this.textContent=old;}
     });
     downloadUpdateButton.addEventListener('click',async function(){

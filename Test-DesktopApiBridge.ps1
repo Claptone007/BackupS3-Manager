@@ -26,10 +26,10 @@ if($main -match 'AddWebResourceRequestedFilter\s*\('){
 }
 Write-Host "[OK] old network-style API transport removed" -ForegroundColor Green
 
-if($api -notmatch 'version\s*=\s*"23\.14"'){
-    throw "ApiBridge.cs version is not 23.14"
+if($api -notmatch 'version\s*=\s*"23\.15"'){
+    throw "ApiBridge.cs version is not 23.15"
 }
-Write-Host "[OK] desktop API version 23.14" -ForegroundColor Green
+Write-Host "[OK] desktop API version 23.15" -ForegroundColor Green
 
 foreach($needle in @(
     '"-RootPath",AppPaths.DataRoot',
