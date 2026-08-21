@@ -1,0 +1,9 @@
+{
+  "version": "23.14",
+  "downloadUrl": "https://github.com/Claptone007/BackupS3-Manager/releases/download/v23.14/BackupS3Manager-v23.14-GitHub-x64.msi",
+  "sha256": "6B8CC8A4BE6C22BEA7582515A297751740969D08AF6A798DC9A7A7890C1690F6",
+  "portableUrl": "https://github.com/Claptone007/BackupS3-Manager/releases/download/v23.14/BackupS3Manager-v23.14-GitHub-Portable-x64.zip",
+  "portableSha256": "4042C7E46D4E7A4CADA012761C280BB354100BA22A8756CF1F266EBD0C363179",
+  "publishedAt": "2026-08-21T00:00:00+03:00",
+  "notes": "BackupS3 Manager 23.14: GitHub-обновления, системный трей, новый экран входа, автоматический выбор конфигурации и улучшения интерфейса."
+}
