@@ -1,9 +1,11 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 using Microsoft.Web.WebView2.Core;
+using System.Net;
+using System.Net.Sockets;
 
 namespace BackupS3Manager;
 
@@ -37,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "23.16";
+    private const string CurrentVersion = "24.4";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -49,8 +51,13 @@ internal sealed class ApiBridge
     private JsonObject? _configCache;
     private DateTime _configMtime;
     private readonly Func<string?, Task<string?>> _browseFolder;
+    private readonly Action _requestExit;
 
-    public ApiBridge(Func<string?, Task<string?>> browseFolder) => _browseFolder = browseFolder;
+    public ApiBridge(Func<string?, Task<string?>> browseFolder, Action requestExit)
+    {
+        _browseFolder = browseFolder;
+        _requestExit = requestExit;
+    }
 
     public async Task<ApiResponse> HandleAsync(string method, Uri uri, string body)
     {
@@ -76,6 +83,15 @@ internal sealed class ApiBridge
                 ("GET", "/api/update/check") => await CheckForUpdateAsync(),
                 ("POST", "/api/update/download") => await StartUpdateDownloadAsync(),
                 ("GET", "/api/update/progress") => GetUpdateDownloadProgress(),
+                ("POST", "/api/update/install") => await InstallDownloadedUpdateAsync(),
+                ("GET", "/api/agents") => GetAgents(),
+                ("GET", "/api/agents/enrollment") => GetAgentEnrollment(),
+                ("POST", "/api/agents/enrollment/rotate") => RotateAgentEnrollment(),
+                ("POST", "/api/agents/create") => CreateAgent(body),
+                ("POST", "/api/agents/package") => CreateAgentPackage(body),
+                ("POST", "/api/agents/delete") => DeleteAgent(body),
+                ("POST", "/api/agents/request-check") => RequestAgentCheck(body),
+                ("POST", "/api/agents/assign-jobs") => await AssignJobsToAgentAsync(body),
 
                 ("GET", "/api/progress") => ReadJsonFile(AppPaths.ProgressPath,
                     """{"running":false,"current":0,"total":0,"percent":0,"database":"","phase":"IDLE","message":"Ожидание запуска","checked":[]}"""),
@@ -110,6 +126,8 @@ internal sealed class ApiBridge
                 ("POST", "/api/s3-profiles/save") => SaveS3Profile(body),
                 ("POST", "/api/s3-profiles/delete") => DeleteS3Profile(body),
                 ("POST", "/api/s3-profiles/test") => await TestS3ProfileAsync(body),
+                ("GET", "/api/runtime/status") => await RuntimeStatusAsync(),
+                ("POST", "/api/runtime/install-aws") => await InstallAwsCliAsync(),
 
                 ("GET", "/api/jobs/detail") => await JobDetailAsync(q.GetValueOrDefault("name", "")),
                 ("GET", "/api/jobs/local-files") => await LocalFilesAsync(q.GetValueOrDefault("name", "")),
@@ -133,6 +151,10 @@ internal sealed class ApiBridge
                 ("GET", "/api/browse-folder") => await BrowseFolderAsync(q.GetValueOrDefault("initialPath", "")),
                 ("GET", "/api/s3-folders") => await S3FoldersAsync(q),
                 ("GET", "/api/s3-connections") => await S3ConnectionsAsync(),
+                ("GET", "/api/s3-explorer/connections") => await S3ExplorerConnectionsAsync(),
+                ("GET", "/api/s3-explorer/list") => await S3ExplorerListAsync(q),
+                ("POST", "/api/s3-explorer/folder") => await S3ExplorerCreateFolderAsync(body),
+                ("POST", "/api/s3-explorer/delete") => await S3ExplorerDeleteObjectAsync(body),
                 ("GET", "/api/upload-progress") => UploadProgress(),
                 ("GET", "/api/jobs/export-ps1") => await ExportJobScriptAsync(q.GetValueOrDefault("name", "")),
                 ("GET", "/api/report") => await ReportAsync(q),
@@ -307,15 +329,17 @@ internal sealed class ApiBridge
         var cfg = await ConfigAsync();
         var jobs = new Dictionary<string,JsonObject>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var n in cfg["Jobs"]?.AsArray() ?? new JsonArray())
-            if (n is JsonObject o && o["Name"] is not null)
-                jobs[o["Name"]!.GetValue<string>()] = (JsonObject)o.DeepClone();
-
         var m = ReadObject(AppPaths.ManagedJobsPath, new JsonObject {
             ["AddedJobs"] = new JsonArray(),
             ["DeletedNames"] = new JsonArray(),
             ["Overrides"] = new JsonObject()
         });
+
+        var useBaseJobs = m["UseBaseJobs"]?.GetValue<bool>() ?? true;
+        if (useBaseJobs)
+            foreach (var n in cfg["Jobs"]?.AsArray() ?? new JsonArray())
+                if (n is JsonObject o && o["Name"] is not null)
+                    jobs[o["Name"]!.GetValue<string>()] = (JsonObject)o.DeepClone();
 
         foreach (var n in m["AddedJobs"]?.AsArray() ?? new JsonArray())
             if (n is JsonObject o && o["Name"] is not null)
@@ -376,6 +400,170 @@ internal sealed class ApiBridge
     private static JsonObject ParseBody(string body) =>
         JsonNode.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body)?.AsObject() ?? new JsonObject();
 
+    private static ApiResponse GetAgents()
+    {
+        var state = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+        var result = new JsonArray();
+        foreach (var source in state["agents"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+        {
+            var lastSeenText = source["lastSeen"]?.ToString();
+            var online = DateTimeOffset.TryParse(lastSeenText, out var lastSeen) && DateTimeOffset.Now - lastSeen < TimeSpan.FromSeconds(45);
+            result.Add(new JsonObject
+            {
+                ["id"] = source["id"]?.ToString(),
+                ["host"] = source["host"]?.ToString(),
+                ["displayName"] = source["displayName"]?.ToString(),
+                ["version"] = source["version"]?.ToString(),
+                ["enrollmentCodeHint"] = source["enrollmentCodeHint"]?.ToString(),
+                ["enrolledAt"] = source["enrolledAt"]?.ToString(),
+                ["lastSeen"] = lastSeenText,
+                ["online"] = online,
+                ["expectedAddress"] = source["expectedAddress"]?.ToString(),
+                ["probePort"] = source["probePort"]?.GetValue<int>() ?? 17832,
+                ["probeOnline"] = source["probeOnline"]?.GetValue<bool>() ?? false,
+                ["probeCheckedAt"] = source["probeCheckedAt"]?.ToString(),
+                ["probeError"] = source["probeError"]?.ToString(),
+                ["report"] = source["report"]?.DeepClone()
+            });
+        }
+        return ApiResponse.JsonText(200, new JsonObject { ["agents"] = result, ["port"] = 17831 }.ToJsonString());
+    }
+
+    private static ApiResponse CreateAgent(string body)
+    {
+        var request = ParseBody(body);
+        var name = (request["displayName"]?.ToString() ?? "").Trim();
+        var address = (request["address"]?.ToString() ?? "").Trim();
+        var port = int.TryParse(request["port"]?.ToString(), out var parsed) ? parsed : 17832;
+        if (name.Length is < 1 or > 80) throw new InvalidOperationException("Укажите название агента (до 80 символов).");
+        if (address.Length is < 1 or > 255 || Uri.CheckHostName(address) == UriHostNameType.Unknown)
+            throw new InvalidOperationException("Укажите корректный IP-адрес или имя сервера.");
+        if (port is < 1024 or > 65535) throw new InvalidOperationException("Порт должен быть от 1024 до 65535.");
+        var state = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["schemaVersion"] = 2, ["agents"] = new JsonArray() });
+        var code = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(6));
+        state["agents"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = Guid.NewGuid().ToString("N"), ["displayName"] = name,
+            ["expectedAddress"] = address, ["probePort"] = port,
+            ["pendingCodeHash"] = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(code))).ToLowerInvariant(),
+            ["enrollmentCodeHint"] = "••••" + code[^4..],
+            ["createdAt"] = DateTimeOffset.Now, ["online"] = false, ["probeOnline"] = false
+        });
+        WriteObjectAtomic(AppPaths.AgentStatePath, state);
+        return ApiResponse.Json(200, new { code, displayName = name, address, port });
+    }
+
+    private static ApiResponse CreateAgentPackage(string body)
+    {
+        var request = ParseBody(body);
+        var name = (request["displayName"]?.ToString() ?? "Agent").Trim();
+        var code = (request["code"]?.ToString() ?? "").Trim();
+        var managerUrl = (request["managerUrl"]?.ToString() ?? "").Trim().TrimEnd('/');
+        var port = int.TryParse(request["port"]?.ToString(), out var parsed) ? parsed : 17832;
+        if (code.Length < 8) throw new InvalidOperationException("Код подключения агента не передан.");
+        if (!Uri.TryCreate(managerUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+            throw new InvalidOperationException("Не удалось определить доступный адрес Manager.");
+        var source = new[]
+        {
+            Path.Combine(AppPaths.InstallRoot, "Agent", "BackupS3Agent.exe"),
+            Path.Combine(AppPaths.InstallRoot, "BackupS3Agent.exe")
+        }.FirstOrDefault(File.Exists);
+        if (source is null) throw new FileNotFoundException("Шаблон BackupS3Agent.exe не включён в сборку Manager.");
+        var configuration = new JsonObject
+        {
+            ["ManagerUrl"] = managerUrl, ["EnrollmentCode"] = code,
+            ["DisplayName"] = name, ["AgentId"] = "", ["Token"] = "",
+            ["PollSeconds"] = 15, ["ListenPort"] = port, ["Jobs"] = new JsonArray()
+        };
+        using var output = new MemoryStream();
+        using (var input = File.OpenRead(source)) input.CopyTo(output);
+        var marker = Encoding.ASCII.GetBytes("\nBS3-CONFIG-V1\n");
+        output.Write(marker);
+        output.Write(Encoding.UTF8.GetBytes(configuration.ToJsonString()));
+        var safeName = string.Concat(name.Select(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_' ? ch : '_')).Trim('_');
+        if (safeName.Length == 0) safeName = "Agent";
+        return new ApiResponse(200, "OK", output.ToArray(), "application/octet-stream",
+            $"Content-Disposition: attachment; filename=BackupS3Agent-{safeName}.exe\r\n");
+    }
+
+    private static ApiResponse DeleteAgent(string body)
+    {
+        var id = ParseBody(body)["id"]?.ToString() ?? "";
+        if (id.Length == 0) throw new InvalidOperationException("ID агента не передан.");
+        lock (AgentHubServer.StateLock)
+        {
+            var state = ReadObject(AppPaths.AgentStatePath,
+                new JsonObject { ["schemaVersion"] = 2, ["agents"] = new JsonArray(), ["revokedHosts"] = new JsonArray() });
+            var agents = state["agents"]?.AsArray() ?? new JsonArray();
+            var agent = agents.OfType<JsonObject>().FirstOrDefault(item => item["id"]?.ToString() == id);
+            if (agent is null) return ApiResponse.Json(404, new { error = "Агент уже удалён." });
+            var host = (agent["host"]?.ToString() ?? "").Trim().ToUpperInvariant();
+            agents.Remove(agent);
+            state["agents"] = agents;
+            var revoked = state["revokedHosts"] as JsonArray ?? new JsonArray();
+            if (host.Length > 0 && !revoked.Any(value => string.Equals(value?.ToString(), host, StringComparison.OrdinalIgnoreCase)))
+                revoked.Add(host);
+            state["revokedHosts"] = revoked;
+            WriteObjectAtomic(AppPaths.AgentStatePath, state);
+            ClearDeletedAgentAssignments(id);
+            AppLog.Info($"Agent Hub: удалён и отозван агент {host} ({id})");
+            return ApiResponse.Json(200, new { status = "deleted", id });
+        }
+    }
+
+    private static void ClearDeletedAgentAssignments(string id)
+    {
+        var managed = ReadObject(AppPaths.ManagedJobsPath, new JsonObject {
+            ["AddedJobs"] = new JsonArray(), ["DeletedNames"] = new JsonArray(), ["Overrides"] = new JsonObject()
+        });
+        foreach (var job in managed["AddedJobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+            if (string.Equals(job["AgentId"]?.ToString(), id, StringComparison.Ordinal)) job["AgentId"] = "";
+        if (managed["Overrides"] is JsonObject overrides)
+            foreach (var patch in overrides.Select(pair => pair.Value).OfType<JsonObject>())
+                if (string.Equals(patch["AgentId"]?.ToString(), id, StringComparison.Ordinal)) patch["AgentId"] = "";
+        WriteObjectAtomic(AppPaths.ManagedJobsPath, managed);
+        AppPaths.GenerateDashboard();
+    }
+
+    private static ApiResponse GetAgentEnrollment()
+    {
+        var settings = ReadObject(AppPaths.SettingsPath, new JsonObject());
+        return ApiResponse.JsonText(200, new JsonObject
+        {
+            ["code"] = settings["AgentEnrollmentCode"]?.ToString() ?? "",
+            ["managerHost"] = Environment.MachineName,
+            ["managerIp"] = DetectManagerIpv4(),
+            ["port"] = 17831
+        }.ToJsonString());
+    }
+
+    private static string DetectManagerIpv4()
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect("8.8.8.8", 65530);
+            if (socket.LocalEndPoint is IPEndPoint endpoint && !IPAddress.IsLoopback(endpoint.Address))
+                return endpoint.Address.ToString();
+        }
+        catch { }
+        try
+        {
+            return Dns.GetHostAddresses(Environment.MachineName)
+                .FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address))
+                ?.ToString() ?? "127.0.0.1";
+        }
+        catch { return "127.0.0.1"; }
+    }
+
+    private static ApiResponse RotateAgentEnrollment()
+    {
+        var settings = ReadObject(AppPaths.SettingsPath, new JsonObject());
+        settings["AgentEnrollmentCode"] = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(6));
+        WriteObjectAtomic(AppPaths.SettingsPath, settings);
+        return GetAgentEnrollment();
+    }
+
     private static string SafeProfileName(string? value)
     {
         var name = (value ?? "").Trim();
@@ -435,6 +623,7 @@ internal sealed class ApiBridge
         var profile = ValidateConfigProfile(JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8))!.AsObject());
         var managed = new JsonObject
         {
+            ["UseBaseJobs"] = false,
             ["AddedJobs"] = profile["jobs"]!.DeepClone(),
             ["DeletedNames"] = new JsonArray(),
             ["Overrides"] = new JsonObject()
@@ -504,17 +693,16 @@ internal sealed class ApiBridge
         if (requested == "new")
         {
             if (!firstRun && current != "new") await SaveConfigProfileAsync("{\"Name\":\"Сохраненная конфигурация\"}");
-            else if (File.Exists(ConfigProfilePath("Новая конфигурация"))) LoadConfigProfile("{\"Name\":\"Новая конфигурация\"}");
-
-            if (current != "new")
+            var isolatedNew = state["isolatedNew"]?.GetValue<bool>() ?? false;
+            if (firstRun || current != "new" || !isolatedNew)
             {
-                var effective = await EffectiveJobsAsync();
-                var deleted = new JsonArray(effective.Select(j => (JsonNode?)j?["Name"]?.ToString()).Where(x => x is not null).ToArray());
                 WriteObjectAtomic(AppPaths.ManagedJobsPath, new JsonObject {
-                    ["AddedJobs"] = new JsonArray(), ["DeletedNames"] = deleted, ["Overrides"] = new JsonObject()
+                    ["UseBaseJobs"] = false, ["AddedJobs"] = new JsonArray(), ["DeletedNames"] = new JsonArray(), ["Overrides"] = new JsonObject()
                 });
                 WriteObjectAtomic(AppPaths.UiSettingsPath, new JsonObject { ["Jobs"] = new JsonObject(), ["DefaultSort"] = "name", ["ShowFavorites"] = true });
+                try { if (File.Exists(AppPaths.StatePath)) File.Delete(AppPaths.StatePath); } catch { }
             }
+            state["isolatedNew"] = true;
         }
         else if (current == "new")
         {
@@ -571,6 +759,22 @@ internal sealed class ApiBridge
         File.Move(tmp, path, true);
     }
 
+    private static string S3AliasesPath => Path.Combine(AppPaths.StateDir, "s3-profile-aliases.json");
+
+    private static string SafeDisplayName(string? value, string fallback)
+    {
+        var name = (value ?? "").Trim();
+        if (name.Length == 0) return fallback;
+        if (name.Length > 80 || name.Any(char.IsControl)) throw new InvalidOperationException("Название подключения должно содержать не более 80 символов.");
+        return name;
+    }
+
+    private static string GetS3DisplayName(string profile)
+    {
+        var aliases = ReadObject(S3AliasesPath, new JsonObject());
+        return aliases[profile]?.ToString()?.Trim() is { Length: > 0 } value ? value : profile;
+    }
+
     private static JsonObject S3ProfileJson(string name, Dictionary<string, string> credentials, Dictionary<string, string>? config, bool reveal)
     {
         string Mask(string value) => value.Length <= 4 ? "••••" : new string('•', Math.Min(12, value.Length - 4)) + value[^4..];
@@ -580,6 +784,7 @@ internal sealed class ApiBridge
         return new JsonObject
         {
             ["name"] = name,
+            ["displayName"] = GetS3DisplayName(name),
             ["accessKey"] = reveal ? access : Mask(access),
             ["secretKey"] = reveal ? secret : Mask(secret),
             ["sessionToken"] = reveal ? token : (token.Length > 0 ? Mask(token) : ""),
@@ -619,6 +824,7 @@ internal sealed class ApiBridge
     {
         var request = ParseBody(body);
         var name = SafeProfileName(request["Name"]?.ToString());
+        var displayName = SafeDisplayName(request["DisplayName"]?.ToString(), name);
         var credentials = ReadIni(AppPaths.AwsCredentialsPath);
         var existing = credentials.GetValueOrDefault(name) ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var access = request["AccessKey"]?.ToString()?.Trim() ?? "";
@@ -641,7 +847,10 @@ internal sealed class ApiBridge
         if (endpoint.Length > 0) cfg["endpoint_url"] = endpoint; else cfg.Remove("endpoint_url");
         config[configName] = cfg;
         WriteIni(AppPaths.AwsConfigPath, config);
-        return ApiResponse.Json(200, new { status = "saved", name, credentialsFile = AppPaths.AwsCredentialsPath });
+        var aliases = ReadObject(S3AliasesPath, new JsonObject());
+        aliases[name] = displayName;
+        WriteObjectAtomic(S3AliasesPath, aliases);
+        return ApiResponse.Json(200, new { status = "saved", name, displayName, credentialsFile = AppPaths.AwsCredentialsPath });
     }
 
     private static ApiResponse DeleteS3Profile(string body)
@@ -653,6 +862,9 @@ internal sealed class ApiBridge
         var config = ReadIni(AppPaths.AwsConfigPath);
         config.Remove(name.Equals("default", StringComparison.OrdinalIgnoreCase) ? "default" : "profile " + name);
         WriteIni(AppPaths.AwsConfigPath, config);
+        var aliases = ReadObject(S3AliasesPath, new JsonObject());
+        aliases.Remove(name);
+        WriteObjectAtomic(S3AliasesPath, aliases);
         return ApiResponse.Json(200, new { status = "deleted", name });
     }
 
@@ -664,10 +876,94 @@ internal sealed class ApiBridge
         var args = new List<string>();
         if (endpoint.Length > 0) args.AddRange(new[] { "--endpoint-url", endpoint });
         args.AddRange(new[] { "--profile", name, "s3api", "list-buckets", "--output", "json" });
-        var result = await RunProcessAsync("aws", args, AppPaths.DataRoot);
+        var aws = ResolveExecutable("aws.exe", "aws");
+        if (aws is null)
+            return ApiResponse.Json(428, new { ok = false, requiresAwsCli = true, error = "Профиль сохранён, но AWS CLI v2 не установлен. Установите его в разделе «Профили и S3»." });
+        var result = await RunProcessAsync(aws, args, AppPaths.DataRoot);
         return result.ExitCode == 0
             ? ApiResponse.Json(200, new { ok = true, message = "Подключение успешно" })
             : ApiResponse.Json(400, new { ok = false, error = result.Output });
+    }
+
+    private static string? ResolveExecutable(params string[] names)
+    {
+        var candidates = new List<string>();
+        foreach (var name in names)
+        {
+            if (Path.IsPathRooted(name)) candidates.Add(name);
+            foreach (var folder in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                candidates.Add(Path.Combine(folder.Trim('"'), name));
+        }
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        candidates.Add(Path.Combine(programFiles, "Amazon", "AWSCLIV2", "aws.exe"));
+        candidates.Add(Path.Combine(local, "Programs", "Amazon", "AWSCLIV2", "aws.exe"));
+        candidates.Add(Path.Combine(local, "Amazon", "AWSCLIV2", "aws.exe"));
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    private static async Task<ApiResponse> RuntimeStatusAsync()
+    {
+        var aws = ResolveExecutable("aws.exe", "aws");
+        var python = ResolveExecutable("python.exe", "python", "python3.exe", "python3", "py.exe", "py");
+        var awsVersion = "";
+        var pythonVersion = "";
+        if (aws is not null)
+        {
+            var r = await RunProcessAsync(aws, new[] { "--version" }, AppPaths.DataRoot, 30000);
+            awsVersion = r.Output;
+        }
+        if (python is not null)
+        {
+            var r = await RunProcessAsync(python, new[] { "--version" }, AppPaths.DataRoot, 30000);
+            pythonVersion = r.Output;
+        }
+        return ApiResponse.Json(200, new {
+            awsInstalled = aws is not null, awsPath = aws ?? "", awsVersion,
+            pythonInstalled = python is not null, pythonPath = python ?? "", pythonVersion,
+            pythonRequired = false,
+            message = aws is null
+                ? "AWS CLI v2 не установлен. S3-профили сохранены, но проверка и загрузка недоступны."
+                : "AWS CLI v2 установлен и готов к работе."
+        });
+    }
+
+    private static async Task<ApiResponse> InstallAwsCliAsync()
+    {
+        var existing = ResolveExecutable("aws.exe", "aws");
+        if (existing is not null) return await RuntimeStatusAsync();
+
+        var installDir = Path.Combine(Path.GetTempPath(), "BackupS3Manager");
+        Directory.CreateDirectory(installDir);
+        var installer = Path.Combine(installDir, "AWSCLIV2-User.msi");
+        var partial = installer + ".part";
+        try
+        {
+            using (var response = await UpdateDownloadHttp.GetAsync("https://awscli.amazonaws.com/AWSCLIV2-User.msi", HttpCompletionOption.ResponseHeadersRead))
+            {
+                response.EnsureSuccessStatusCode();
+                await using var input = await response.Content.ReadAsStreamAsync();
+                await using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true);
+                await input.CopyToAsync(output);
+                await output.FlushAsync();
+            }
+            File.Move(partial, installer, true);
+            var result = await RunProcessAsync("msiexec.exe", new[] { "/i", installer, "/passive", "/norestart" }, AppPaths.DataRoot, 10 * 60 * 1000);
+            if (result.ExitCode is not (0 or 1641 or 3010))
+                return ApiResponse.Json(500, new { error = $"Установщик AWS CLI завершился с кодом {result.ExitCode}. {result.Output}" });
+            var status = await RuntimeStatusAsync();
+            AppLog.Info("AWS CLI v2 установлен из официального AWSCLIV2-User.msi");
+            return status;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("Ошибка установки AWS CLI v2", ex);
+            return ApiResponse.Json(500, new { error = "Не удалось установить AWS CLI v2: " + ex.Message });
+        }
+        finally
+        {
+            try { if (File.Exists(partial)) File.Delete(partial); } catch { }
+        }
     }
 
     private static JsonObject? FindStateJob(string name)
@@ -918,6 +1214,8 @@ internal sealed class ApiBridge
         var extension = Path.GetExtension(uri.AbsolutePath).Equals(".zip", StringComparison.OrdinalIgnoreCase) ? ".zip" : ".msi";
         var version = info["latestVersion"]?.ToString() ?? "update";
         var destination = Path.Combine(downloads, $"BackupS3Manager-v{version}-x64{extension}");
+        if (File.Exists(destination) || File.Exists(destination + ".part"))
+            destination = Path.Combine(downloads, $"BackupS3Manager-v{version}-x64-{DateTime.Now:yyyyMMdd-HHmmss}{extension}");
         var expectedHash = info["sha256"]?.ToString()?.Trim();
         lock (UpdateDownloadLock)
         {
@@ -936,28 +1234,34 @@ internal sealed class ApiBridge
         var partial = destination + ".part";
         try
         {
-            using var response = await UpdateDownloadHttp.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
-            response.EnsureSuccessStatusCode();
-            var total = response.Content.Headers.ContentLength ?? 0L;
-            lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "downloading"; UpdateDownloadState["totalBytes"] = total; }
-            await using var input = await response.Content.ReadAsStreamAsync();
-            await using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true);
-            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
-            var buffer = new byte[1024 * 1024];
-            long downloaded = 0;
-            var started = System.Diagnostics.Stopwatch.StartNew();
-            int read;
-            while ((read = await input.ReadAsync(buffer)) > 0)
+            string actualHash;
+            using (var response = await UpdateDownloadHttp.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead))
             {
-                await output.WriteAsync(buffer.AsMemory(0, read));
-                hash.AppendData(buffer, 0, read);
-                downloaded += read;
-                var speed = started.Elapsed.TotalSeconds > 0 ? (long)(downloaded / started.Elapsed.TotalSeconds) : 0L;
-                var percent = total > 0 ? (int)Math.Clamp(downloaded * 100L / total, 0, 100) : 0;
-                lock (UpdateDownloadLock) { UpdateDownloadState["downloadedBytes"] = downloaded; UpdateDownloadState["percent"] = percent; UpdateDownloadState["speedBytesPerSecond"] = speed; }
+                response.EnsureSuccessStatusCode();
+                var total = response.Content.Headers.ContentLength ?? 0L;
+                lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "downloading"; UpdateDownloadState["totalBytes"] = total; }
+                await using (var input = await response.Content.ReadAsStreamAsync())
+                await using (var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true))
+                using (var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256))
+                {
+                    var buffer = new byte[1024 * 1024];
+                    long downloaded = 0;
+                    var started = System.Diagnostics.Stopwatch.StartNew();
+                    int read;
+                    while ((read = await input.ReadAsync(buffer)) > 0)
+                    {
+                        await output.WriteAsync(buffer.AsMemory(0, read));
+                        hash.AppendData(buffer, 0, read);
+                        downloaded += read;
+                        var speed = started.Elapsed.TotalSeconds > 0 ? (long)(downloaded / started.Elapsed.TotalSeconds) : 0L;
+                        var percent = total > 0 ? (int)Math.Clamp(downloaded * 100L / total, 0, 100) : 0;
+                        lock (UpdateDownloadLock) { UpdateDownloadState["downloadedBytes"] = downloaded; UpdateDownloadState["percent"] = percent; UpdateDownloadState["speedBytesPerSecond"] = speed; }
+                    }
+                    await output.FlushAsync();
+                    actualHash = Convert.ToHexString(hash.GetHashAndReset());
+                }
             }
-            await output.FlushAsync();
-            var actualHash = Convert.ToHexString(hash.GetHashAndReset());
+            // FileStream must be disposed before the .part file can be renamed on Windows.
             if (!string.IsNullOrWhiteSpace(expectedHash) && !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("SHA-256 загруженного обновления не совпадает с manifest.");
             File.Move(partial, destination, true);
@@ -970,6 +1274,40 @@ internal sealed class ApiBridge
             lock (UpdateDownloadLock) { UpdateDownloadState["status"] = "error"; UpdateDownloadState["running"] = false; UpdateDownloadState["error"] = ex.Message; }
             AppLog.Error("Ошибка загрузки обновления", ex);
         }
+    }
+
+    private async Task<ApiResponse> InstallDownloadedUpdateAsync()
+    {
+        string path;
+        lock (UpdateDownloadLock)
+        {
+            if (!string.Equals(UpdateDownloadState["status"]?.ToString(), "completed", StringComparison.OrdinalIgnoreCase))
+                return ApiResponse.Json(409, new { error = "Обновление ещё не скачано." });
+            path = UpdateDownloadState["path"]?.ToString() ?? "";
+        }
+        if (!File.Exists(path) || !Path.GetExtension(path).Equals(".msi", StringComparison.OrdinalIgnoreCase))
+            return ApiResponse.Json(404, new { error = "Скачанный MSI не найден." });
+        static string PsQuote(string value) => "'" + value.Replace("'", "''") + "'";
+        var currentPid = Environment.ProcessId;
+        var executable = Environment.ProcessPath ?? "";
+        var command = $"$ErrorActionPreference='Stop'; Wait-Process -Id {currentPid}; " +
+            $"$installer=Start-Process msiexec.exe -ArgumentList @('/i',{PsQuote(path)}) -PassThru -Wait; " +
+            $"if($installer.ExitCode -in @(0,1641,3010)){{Start-Process {PsQuote(executable)}}}";
+        var psi = new ProcessStartInfo {
+            FileName = AppPaths.PowerShellExe(),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = Path.GetDirectoryName(path) ?? AppPaths.DataRoot
+        };
+        foreach (var arg in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command })
+            psi.ArgumentList.Add(arg);
+        var process = Process.Start(psi);
+        if (process is null) return ApiResponse.Json(500, new { error = "Не удалось запустить процесс обновления." });
+        AppLog.Info($"Запущена установка обновления: {path}");
+        _ = Task.Run(async () => { await Task.Delay(900); _requestExit(); });
+        await Task.CompletedTask;
+        return ApiResponse.Json(202, new { status = "installer_started", path, message = "BackupS3 закроется, установит обновление и запустится снова." });
     }
 
     private static string NormalizeVersion(string value)
@@ -1043,6 +1381,68 @@ internal sealed class ApiBridge
 
         var localPath = j["LocalPath"]?.ToString() ?? "";
         var prefix = j["FilePrefix"]?.ToString() ?? "";
+        var assignedAgentId = j["AgentId"]?.ToString() ?? "";
+        var agentState = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+        var agents = (agentState["agents"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>()).ToArray();
+
+        static JsonObject? FindReportedJob(JsonObject? candidate, string jobName) =>
+            (candidate?["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                .FirstOrDefault(item => string.Equals(item["name"]?.ToString(), jobName, StringComparison.OrdinalIgnoreCase));
+
+        // Старые базы могли быть созданы до появления AgentId. Кроме того, идентификатор
+        // может устареть после переустановки агента. Сначала используем явное назначение,
+        // затем безопасно находим самый свежий отчёт агента, содержащий эту базу.
+        JsonObject? agent = null;
+        JsonObject? remoteJob = null;
+        if (assignedAgentId.Length > 0)
+        {
+            agent = agents
+                .FirstOrDefault(item => string.Equals(item["id"]?.ToString(), assignedAgentId, StringComparison.Ordinal));
+            remoteJob = FindReportedJob(agent, name);
+        }
+
+        if (remoteJob is null)
+        {
+            agent = agents
+                .Where(item => FindReportedJob(item, name) is not null)
+                .OrderByDescending(item => DateTimeOffset.TryParse(item["lastSeen"]?.ToString(), out var seen)
+                    ? seen : DateTimeOffset.MinValue)
+                .FirstOrDefault();
+            remoteJob = FindReportedJob(agent, name);
+        }
+
+        if (remoteJob is not null)
+        {
+            if (remoteJob["available"]?.GetValue<bool>() != true)
+                return ApiResponse.Json(500, new { error = remoteJob["error"]?.ToString() ?? "Локальная папка недоступна агенту." });
+
+            var s3Remote = await ListS3ObjectsAsync(j);
+            var remoteKeys = new HashSet<string>(s3Remote.Select(x => x["Key"]?.ToString() ?? ""), StringComparer.Ordinal);
+            var remoteRoot = (j["S3Path"]?.ToString() ?? "").Trim('/');
+            var remoteFiles = new JsonArray();
+            foreach (var node in remoteJob["files"]?.AsArray() ?? new JsonArray())
+            {
+                if (node is not JsonObject file) continue;
+                var fileName = file["name"]?.ToString() ?? "";
+                var key = remoteRoot.Length > 0 ? $"{remoteRoot}/{fileName}" : fileName;
+                remoteFiles.Add(new JsonObject {
+                    ["Name"] = fileName,
+                    ["FullName"] = file["fullName"]?.ToString() ?? "",
+                    ["SizeBytes"] = file["sizeBytes"]?.DeepClone() ?? 0,
+                    ["LastWriteTime"] = file["lastWriteTime"]?.ToString(),
+                    ["S3Key"] = key,
+                    ["OnS3"] = remoteKeys.Contains(key)
+                });
+            }
+            return ApiResponse.JsonText(200, new JsonObject {
+                ["name"] = name, ["localPath"] = remoteJob["localPath"]?.ToString() ?? localPath,
+                ["bucket"] = j["Bucket"]?.ToString(), ["s3Path"] = j["S3Path"]?.ToString(),
+                ["count"] = remoteFiles.Count, ["files"] = remoteFiles,
+                ["s3LiveChecked"] = true, ["s3LiveError"] = "",
+                ["checkedAt"] = agent?["report"]?["generatedAt"]?.ToString() ?? DateTimeOffset.Now.ToString("o"),
+                ["source"] = "agent", ["agent"] = agent?["displayName"]?.ToString() ?? agent?["host"]?.ToString()
+            }.ToJsonString());
+        }
         if (!Directory.Exists(localPath))
             return ApiResponse.Json(500, new { error = $"Локальная папка недоступна: {localPath}" });
 
@@ -1193,8 +1593,83 @@ internal sealed class ApiBridge
         ovs[name] = patch;
         m["Overrides"] = ovs;
         WriteObjectAtomic(AppPaths.ManagedJobsPath, m);
+        AssignJobToAgent(name, patch["AgentId"]?.ToString() ?? "", patch["LocalPath"]?.ToString() ?? "");
         AppPaths.GenerateDashboard();
         return ApiResponse.Json(200, new { status = "saved" });
+    }
+
+    private static void AssignJobToAgent(string name, string agentId, string localPath)
+    {
+        lock (AgentHubServer.StateLock)
+        {
+            var state = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+            foreach (var agent in state["agents"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+            {
+                var assigned = agent["assignedJobs"] as JsonArray ?? new JsonArray();
+                for (var index = assigned.Count - 1; index >= 0; index--)
+                    if (string.Equals(assigned[index]?["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase)) assigned.RemoveAt(index);
+                if (agent["id"]?.ToString() == agentId)
+                    assigned.Add(new JsonObject { ["name"] = name, ["localPath"] = localPath });
+                agent["assignedJobs"] = assigned;
+            }
+            WriteObjectAtomic(AppPaths.AgentStatePath, state);
+        }
+    }
+
+    private static ApiResponse RequestAgentCheck(string body)
+    {
+        var request = ParseBody(body);var agentId=request["agentId"]?.ToString()??"";var name=request["name"]?.ToString()??"";
+        if(agentId.Length==0||name.Length==0)return ApiResponse.Json(400,new{error="Не указан агент или база."});
+        lock(AgentHubServer.StateLock)
+        {
+            var state=ReadObject(AppPaths.AgentStatePath,new JsonObject{["agents"]=new JsonArray()});
+            var agent=state["agents"]?.AsArray().OfType<JsonObject>().FirstOrDefault(item=>item["id"]?.ToString()==agentId);
+            if(agent is null)return ApiResponse.Json(404,new{error="Агент не найден."});
+            agent["forceCheckRequestedAt"]=DateTimeOffset.Now;agent["forceCheckJob"]=name;WriteObjectAtomic(AppPaths.AgentStatePath,state);
+            return ApiResponse.Json(202,new{status="queued",message="Команда передана агенту. Результат появится после ближайшего heartbeat."});
+        }
+    }
+
+    private async Task<ApiResponse> AssignJobsToAgentAsync(string body)
+    {
+        var request = ParseBody(body);
+        var agentId = (request["agentId"]?.ToString() ?? "").Trim();
+        var names = request["names"]?.AsArray()
+            .Select(node => (node?.ToString() ?? "").Trim())
+            .Where(name => name.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray() ?? Array.Empty<string>();
+        if (names.Length == 0) return ApiResponse.Json(400, new { error = "Не выбраны базы для переноса." });
+
+        if (agentId.Length > 0)
+        {
+            var state = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+            if (!(state["agents"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                .Any(agent => string.Equals(agent["id"]?.ToString(), agentId, StringComparison.Ordinal)))
+                return ApiResponse.Json(404, new { error = "Выбранный агент не найден." });
+        }
+
+        var managed = ReadObject(AppPaths.ManagedJobsPath, new JsonObject {
+            ["AddedJobs"] = new JsonArray(), ["DeletedNames"] = new JsonArray(), ["Overrides"] = new JsonObject()
+        });
+        var overrides = managed["Overrides"] as JsonObject ?? new JsonObject();
+        var assigned = 0;
+        foreach (var name in names)
+        {
+            var job = await EffectiveJobAsync(name);
+            if (job is null) continue;
+            var patch = overrides[name] as JsonObject ?? new JsonObject();
+            patch["AgentId"] = agentId;
+            overrides[name] = patch;
+            AssignJobToAgent(name, agentId, job["LocalPath"]?.ToString() ?? "");
+            AppendHistoryEvent("JOB_AGENT_CHANGED", name,
+                agentId.Length == 0 ? "База перенесена на Manager" : "База назначена удалённому агенту");
+            assigned++;
+        }
+        managed["Overrides"] = overrides;
+        WriteObjectAtomic(AppPaths.ManagedJobsPath, managed);
+        AppPaths.GenerateDashboard();
+        return ApiResponse.Json(200, new { status = "assigned", count = assigned, agentId });
     }
 
     private async Task<ApiResponse> DeleteJobAsync(string body)
@@ -1286,6 +1761,47 @@ internal sealed class ApiBridge
         var file = o["FilePath"]?.ToString() ?? "";
         var op = Guid.NewGuid().ToString();
 
+        var job = await EffectiveJobAsync(name);
+        if (job is null) return ApiResponse.Json(404, new { error = "База не найдена." });
+
+        // Удалённый путь должен обрабатывать агент, у которого этот диск доступен.
+        lock (AgentHubServer.StateLock)
+        {
+            var agentState = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+            var agents = agentState["agents"]?.AsArray().OfType<JsonObject>().ToArray() ?? Array.Empty<JsonObject>();
+            var assignedAgentId = job["AgentId"]?.ToString() ?? "";
+            JsonObject? agent = assignedAgentId.Length > 0
+                ? agents.FirstOrDefault(item => item["id"]?.ToString() == assignedAgentId)
+                : null;
+            agent ??= agents
+                .Where(item => (item["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                    .Any(remote => string.Equals(remote["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(item => DateTimeOffset.TryParse(item["lastSeen"]?.ToString(), out var seen) ? seen : DateTimeOffset.MinValue)
+                .FirstOrDefault();
+
+            var remoteJob = (agent?["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                .FirstOrDefault(remote => string.Equals(remote["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase));
+            if (agent is not null && remoteJob is not null)
+            {
+                var commands = agent["pendingCommands"] as JsonArray ?? new JsonArray();
+                commands.Add(new JsonObject {
+                    ["id"] = op, ["type"] = "upload", ["database"] = name,
+                    ["filePath"] = file, ["createdAt"] = DateTimeOffset.Now
+                });
+                agent["pendingCommands"] = commands;
+                var queued = new JsonObject {
+                    ["id"] = op, ["database"] = name, ["filePath"] = file,
+                    ["status"] = "QUEUED", ["percent"] = 0,
+                    ["message"] = $"Команда загрузки передана агенту {agent["displayName"] ?? agent["host"]}",
+                    ["source"] = "agent", ["agentId"] = agent["id"]?.ToString(),
+                    ["startedAt"] = DateTimeOffset.Now.ToString("o")
+                };
+                WriteObjectAtomic(Path.Combine(AppPaths.ManualUploadsDir, op + ".json"), queued);
+                WriteObjectAtomic(AppPaths.AgentStatePath, agentState);
+                return ApiResponse.Json(202, new { status = "queued", id = op, operationId = op, agent = agent["displayName"]?.ToString() ?? agent["host"]?.ToString() });
+            }
+        }
+
         var initial = new JsonObject {
             ["id"] = op,
             ["database"] = name,
@@ -1327,6 +1843,51 @@ internal sealed class ApiBridge
         var path = Path.Combine(AppPaths.ManualUploadsDir, id + ".json");
         if (!File.Exists(path)) return ApiResponse.Json(404, new { error = "operation not found" });
         return ApiResponse.JsonText(200, File.ReadAllText(path, Encoding.UTF8));
+    }
+
+    internal static void WriteAgentUploadStatus(string id, JsonObject status)
+    {
+        Directory.CreateDirectory(AppPaths.ManualUploadsDir);
+        WriteObjectAtomic(Path.Combine(AppPaths.ManualUploadsDir, id + ".json"), status);
+    }
+
+    internal static void ApplyAgentUploadResult(JsonObject result)
+    {
+        var database = result["database"]?.ToString() ?? "";
+        var key = result["s3Key"]?.ToString() ?? "";
+        if (database.Length == 0 || key.Length == 0) return;
+        var state = ReadObject(AppPaths.StatePath, new JsonObject { ["Jobs"] = new JsonArray() });
+        var job = state["Jobs"]?.AsArray().OfType<JsonObject>()
+            .FirstOrDefault(item => string.Equals(item["Name"]?.ToString(), database, StringComparison.OrdinalIgnoreCase));
+        if (job is null) return;
+
+        var objects = job["S3Objects"] as JsonArray ?? new JsonArray();
+        var existing = objects.OfType<JsonObject>().FirstOrDefault(item =>
+            string.Equals(item["Key"]?.ToString(), key, StringComparison.Ordinal));
+        var size = result["sizeBytes"]?.GetValue<long>() ?? 0L;
+        var modified = result["finishedAt"]?.ToString() ?? DateTimeOffset.Now.ToString("o");
+        if (existing is null)
+            objects.Add(new JsonObject { ["Key"] = key, ["SizeBytes"] = size, ["LastModified"] = modified });
+        else
+        {
+            existing["SizeBytes"] = size;
+            existing["LastModified"] = modified;
+        }
+        job["S3Objects"] = new JsonArray(objects.OfType<JsonObject>()
+            .OrderByDescending(item => DateTimeOffset.TryParse(item["LastModified"]?.ToString(), out var stamp) ? stamp : DateTimeOffset.MinValue)
+            .Select(item => (JsonNode?)item.DeepClone()).ToArray());
+        job["S3ObjectCount"] = objects.Count;
+        job["S3TotalBytes"] = objects.OfType<JsonObject>().Sum(item => item["SizeBytes"]?.GetValue<long>() ?? 0L);
+        job["S3Latest"] = modified;
+        var uploadedName = Path.GetFileName(result["filePath"]?.ToString() ?? "");
+        if (string.Equals(job["LocalFile"]?.ToString(), uploadedName, StringComparison.OrdinalIgnoreCase))
+        {
+            job["Status"] = "OK"; job["StatusText"] = "Локальная копия и последний объект S3 синхронизированы";
+            job["SyncStatus"] = "SYNCED"; job["HealthScore"] = 100; job["ReasonCodes"] = new JsonArray();
+        }
+        WriteObjectAtomic(AppPaths.StatePath, state);
+        AppendHistoryEvent("UPLOAD_SUCCESS", database, $"Агент загрузил файл на S3: {key}");
+        AppPaths.GenerateDashboard();
     }
 
     private async Task<ApiResponse> DeleteS3ObjectAsync(string body)
@@ -1549,6 +2110,177 @@ internal sealed class ApiBridge
         foreach (var n in data["CommonPrefixes"]?.AsArray() ?? new JsonArray())
             if (n?["Prefix"] is not null) folders.Add(n["Prefix"]!.ToString().Trim('/'));
         return ApiResponse.Json(200, new { bucket = q.GetValueOrDefault("bucket",""), folders });
+    }
+
+    private async Task<ApiResponse> S3ExplorerConnectionsAsync()
+    {
+        var credentials = ReadIni(AppPaths.AwsCredentialsPath);
+        var config = ReadIni(AppPaths.AwsConfigPath);
+        var global = await ConfigAsync();
+        var fallbackEndpoint = global["Global"]?["EndpointUrl"]?.ToString()?.Trim() ?? "";
+        var result = new JsonArray();
+
+        foreach (var profile in credentials.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+        {
+            var configName = profile.Equals("default", StringComparison.OrdinalIgnoreCase) ? "default" : "profile " + profile;
+            var endpoint = config.GetValueOrDefault(configName)?.GetValueOrDefault("endpoint_url", "")?.Trim() ?? "";
+            if (endpoint.Length == 0) endpoint = fallbackEndpoint;
+            var args = new List<string>();
+            if (endpoint.Length > 0) args.AddRange(new[] { "--endpoint-url", endpoint });
+            args.AddRange(new[] { "--profile", profile, "s3api", "list-buckets", "--output", "json" });
+            var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
+            var buckets = new JsonArray();
+            if (r.ExitCode == 0 && !string.IsNullOrWhiteSpace(r.StdOut))
+            {
+                var data = JsonNode.Parse(r.StdOut)?.AsObject();
+                foreach (var item in data?["Buckets"]?.AsArray() ?? new JsonArray())
+                    if (item is JsonObject bucket && !string.IsNullOrWhiteSpace(bucket["Name"]?.ToString()))
+                        buckets.Add(new JsonObject {
+                            ["name"] = bucket["Name"]?.ToString(),
+                            ["createdAt"] = bucket["CreationDate"]?.ToString()
+                        });
+            }
+            result.Add(new JsonObject {
+                ["profile"] = profile,
+                ["displayName"] = GetS3DisplayName(profile),
+                ["endpoint"] = endpoint,
+                ["ok"] = r.ExitCode == 0,
+                ["error"] = r.ExitCode == 0 ? "" : r.Output,
+                ["buckets"] = buckets
+            });
+        }
+        return ApiResponse.JsonText(200, new JsonObject {
+            ["connections"] = result,
+            ["checkedAt"] = DateTimeOffset.Now.ToString("o")
+        }.ToJsonString());
+    }
+
+    private static bool IsValidBucket(string bucket) =>
+        bucket.Length > 0 && !bucket.Any(ch => !(char.IsLetterOrDigit(ch) || ch is '.' or '-'));
+
+    private async Task<(string Profile, string Bucket, string Endpoint, string Prefix)> ParseS3ExplorerTargetAsync(JsonObject request)
+    {
+        var profile = SafeProfileName(request["Profile"]?.ToString() ?? "default");
+        var bucket = request["Bucket"]?.ToString()?.Trim() ?? "";
+        var prefix = request["Prefix"]?.ToString()?.TrimStart('/') ?? "";
+        if (!IsValidBucket(bucket)) throw new InvalidOperationException("Некорректное имя S3-бакета.");
+        if (prefix.Length > 1024 || prefix.Contains("..", StringComparison.Ordinal) || prefix.Contains('\\') || prefix.Any(char.IsControl))
+            throw new InvalidOperationException("Некорректный путь S3.");
+        if (prefix.Length > 0 && !prefix.EndsWith('/')) prefix += "/";
+        var config = ReadIni(AppPaths.AwsConfigPath);
+        var configName = profile.Equals("default", StringComparison.OrdinalIgnoreCase) ? "default" : "profile " + profile;
+        var endpoint = config.GetValueOrDefault(configName)?.GetValueOrDefault("endpoint_url", "")?.Trim() ?? "";
+        if (endpoint.Length == 0)
+        {
+            var global = await ConfigAsync();
+            endpoint = global["Global"]?["EndpointUrl"]?.ToString()?.Trim() ?? "";
+        }
+        return (profile, bucket, endpoint, prefix);
+    }
+
+    private static List<string> S3TargetArgs(string profile, string endpoint)
+    {
+        var args = new List<string>();
+        if (endpoint.Length > 0) args.AddRange(new[] { "--endpoint-url", endpoint });
+        args.AddRange(new[] { "--profile", profile });
+        return args;
+    }
+
+    private async Task<ApiResponse> S3ExplorerCreateFolderAsync(string body)
+    {
+        try
+        {
+            var request = ParseBody(body);
+            var target = await ParseS3ExplorerTargetAsync(request);
+            var name = request["Name"]?.ToString()?.Trim().Trim('/') ?? "";
+            if (name.Length is < 1 or > 180 || name is "." or ".." || name.Contains('/') || name.Contains('\\') || name.Any(char.IsControl))
+                return ApiResponse.Json(400, new { error = "Имя папки должно быть одним безопасным сегментом без символов / и \\." });
+            var key = target.Prefix + name + "/";
+            var args = S3TargetArgs(target.Profile, target.Endpoint);
+            args.AddRange(new[] { "s3api", "put-object", "--bucket", target.Bucket, "--key", key, "--output", "json" });
+            var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
+            if (r.ExitCode != 0) return ApiResponse.Json(502, new { error = r.Output });
+            WriteAudit("INFO", "S3_FOLDER_CREATED", $"s3://{target.Bucket}/{key}", 200, $"profile={target.Profile}");
+            return ApiResponse.Json(200, new { status = "created", key, name });
+        }
+        catch (Exception ex) { return ApiResponse.Json(400, new { error = ex.Message }); }
+    }
+
+    private async Task<ApiResponse> S3ExplorerDeleteObjectAsync(string body)
+    {
+        try
+        {
+            var request = ParseBody(body);
+            var target = await ParseS3ExplorerTargetAsync(request);
+            var key = request["Key"]?.ToString()?.TrimStart('/') ?? "";
+            if (key.Length is < 1 or > 1024 || key.EndsWith('/') || key.Contains("..", StringComparison.Ordinal) || key.Contains('\\') || key.Any(char.IsControl))
+                return ApiResponse.Json(400, new { error = "Через проводник можно удалять только отдельные файлы с корректным ключом S3." });
+            if (target.Prefix.Length > 0 && !key.StartsWith(target.Prefix, StringComparison.Ordinal))
+                return ApiResponse.Json(400, new { error = "Файл находится вне открытой папки." });
+            var args = S3TargetArgs(target.Profile, target.Endpoint);
+            args.AddRange(new[] { "s3api", "delete-object", "--bucket", target.Bucket, "--key", key });
+            var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
+            if (r.ExitCode != 0) return ApiResponse.Json(502, new { error = r.Output });
+            WriteAudit("WARN", "S3_OBJECT_DELETED", $"s3://{target.Bucket}/{key}", 200, $"profile={target.Profile}");
+            return ApiResponse.Json(200, new { status = "deleted", key });
+        }
+        catch (Exception ex) { return ApiResponse.Json(400, new { error = ex.Message }); }
+    }
+
+    private async Task<ApiResponse> S3ExplorerListAsync(Dictionary<string,string> q)
+    {
+        var profile = SafeProfileName(q.GetValueOrDefault("profile", "default"));
+        var bucket = q.GetValueOrDefault("bucket", "").Trim();
+        var prefix = q.GetValueOrDefault("prefix", "").TrimStart('/');
+        if (bucket.Length == 0 || bucket.Any(ch => !(char.IsLetterOrDigit(ch) || ch is '.' or '-')))
+            return ApiResponse.Json(400, new { error = "Некорректное имя S3-бакета." });
+        if (prefix.Contains("..", StringComparison.Ordinal) || prefix.Contains('\\'))
+            return ApiResponse.Json(400, new { error = "Некорректный путь S3." });
+        if (prefix.Length > 0 && !prefix.EndsWith('/')) prefix += "/";
+
+        var config = ReadIni(AppPaths.AwsConfigPath);
+        var configName = profile.Equals("default", StringComparison.OrdinalIgnoreCase) ? "default" : "profile " + profile;
+        var endpoint = config.GetValueOrDefault(configName)?.GetValueOrDefault("endpoint_url", "")?.Trim() ?? "";
+        if (endpoint.Length == 0)
+        {
+            var global = await ConfigAsync();
+            endpoint = global["Global"]?["EndpointUrl"]?.ToString()?.Trim() ?? "";
+        }
+        var args = new List<string>();
+        if (endpoint.Length > 0) args.AddRange(new[] { "--endpoint-url", endpoint });
+        args.AddRange(new[] { "--profile", profile, "s3api", "list-objects-v2", "--bucket", bucket,
+            "--prefix", prefix, "--delimiter", "/", "--max-keys", "1000", "--output", "json" });
+        var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
+        if (r.ExitCode != 0) return ApiResponse.Json(502, new { error = string.IsNullOrWhiteSpace(r.Output) ? "AWS CLI не вернул данные." : r.Output });
+        var data = string.IsNullOrWhiteSpace(r.StdOut) ? new JsonObject() : JsonNode.Parse(r.StdOut)?.AsObject() ?? new JsonObject();
+        var folders = new JsonArray();
+        foreach (var item in data["CommonPrefixes"]?.AsArray() ?? new JsonArray())
+        {
+            var full = item?["Prefix"]?.ToString() ?? "";
+            var name = full[prefix.Length..].TrimEnd('/');
+            if (name.Length > 0) folders.Add(new JsonObject { ["name"] = name, ["prefix"] = full });
+        }
+        var objects = new JsonArray();
+        foreach (var item in data["Contents"]?.AsArray() ?? new JsonArray())
+        {
+            if (item is not JsonObject o) continue;
+            var key = o["Key"]?.ToString() ?? "";
+            if (key == prefix || key.EndsWith('/')) continue;
+            objects.Add(new JsonObject {
+                ["name"] = key.StartsWith(prefix, StringComparison.Ordinal) ? key[prefix.Length..] : key,
+                ["key"] = key,
+                ["sizeBytes"] = o["Size"]?.GetValue<long>() ?? 0L,
+                ["lastModified"] = o["LastModified"]?.ToString(),
+                ["storageClass"] = o["StorageClass"]?.ToString() ?? "",
+                ["etag"] = (o["ETag"]?.ToString() ?? "").Trim('"')
+            });
+        }
+        return ApiResponse.JsonText(200, new JsonObject {
+            ["profile"] = profile, ["endpoint"] = endpoint, ["bucket"] = bucket, ["prefix"] = prefix,
+            ["folders"] = folders, ["objects"] = objects,
+            ["isTruncated"] = data["IsTruncated"]?.GetValue<bool>() ?? false,
+            ["count"] = objects.Count, ["checkedAt"] = DateTimeOffset.Now.ToString("o")
+        }.ToJsonString());
     }
 
     private static ApiResponse UploadProgress()
@@ -1780,6 +2512,8 @@ internal sealed class ApiBridge
     private static async Task<(int ExitCode,string StdOut,string StdErr,string Output)> RunProcessAsync(
         string exe, IEnumerable<string> args, string workingDir, int timeoutMs = 120000)
     {
+        if (exe.Equals("aws", StringComparison.OrdinalIgnoreCase) || exe.Equals("aws.exe", StringComparison.OrdinalIgnoreCase))
+            exe = ResolveExecutable("aws.exe", "aws") ?? exe;
         var psi = new ProcessStartInfo {
             FileName = exe, WorkingDirectory = workingDir,
             UseShellExecute = false, CreateNoWindow = true,

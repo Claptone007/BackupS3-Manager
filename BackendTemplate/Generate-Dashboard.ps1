@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot "BackupJobs.psd1")
 )
 
@@ -21,7 +21,7 @@ function Get-StatusLabel {
     switch (([string]$Status).ToUpperInvariant()) {
         "OK"       { "В норме" }
         "UPLOADED" { "Загружено" }
-        "READY"    { "Готово" }
+        "READY"    { "Ожидает загрузки" }
         "WAITING"  { "Ожидание" }
         "STALE"    { "Устарело" }
         "WARNING"  { "Предупреждение" }
@@ -107,12 +107,14 @@ function Get-EffectiveDashboardJobs {
     $added=@()
     $deleted=@()
     $overrides=@{}
+    $useBaseJobs=$true
 
     if(Test-Path $ManagedJobsPath -PathType Leaf){
         try{
             $managed=Get-Content $ManagedJobsPath -Raw -Encoding UTF8|ConvertFrom-Json
             $added=@($managed.AddedJobs)
             $deleted=@($managed.DeletedNames)
+            if($null-ne$managed.UseBaseJobs){$useBaseJobs=[bool]$managed.UseBaseJobs}
 
             if($null-ne$managed.Overrides){
                 foreach($p in $managed.Overrides.PSObject.Properties){
@@ -126,9 +128,11 @@ function Get-EffectiveDashboardJobs {
     # BackupJobs.psd1. Keep exactly one row per name; the managed copy wins.
     $byName=@{}
 
-    foreach($j in @($BaseJobs)){
-        if($null-ne$j -and $deleted -notcontains [string]$j.Name){
-            $byName[[string]$j.Name]=$j
+    if($useBaseJobs){
+        foreach($j in @($BaseJobs)){
+            if($null-ne$j -and $deleted -notcontains [string]$j.Name){
+                $byName[[string]$j.Name]=$j
+            }
         }
     }
 
@@ -213,8 +217,12 @@ if (Test-Path $stateFile -PathType Leaf) {
 else {
     $state = [PSCustomObject]@{
         GeneratedAt = (Get-Date).ToString("o")
+        Host        = $env:COMPUTERNAME
         Jobs        = @()
     }
+}
+if([string]::IsNullOrWhiteSpace([string]$state.Host)){
+    $state | Add-Member -NotePropertyName Host -NotePropertyValue $env:COMPUTERNAME -Force
 }
 # v23.11: the visible database list is driven by the effective
 # configuration (BackupJobs.psd1 + managed-jobs.json), not only state.json.
@@ -253,6 +261,82 @@ foreach($configured in $effectiveJobs){
 
 $jobs=@($jobs|Sort-Object Name)
 
+$registeredAgents=@()
+$agentStatePath=Join-Path (Split-Path $stateFile -Parent) "agents.json"
+if(Test-Path $agentStatePath -PathType Leaf){
+    try{$registeredAgents=@((Get-Content $agentStatePath -Raw -Encoding UTF8|ConvertFrom-Json).agents)}catch{$registeredAgents=@()}
+}
+
+# Объединяем удалённые локальные данные до расчёта верхних счётчиков и строк.
+# Состояние Manager может содержать старую ошибку о недоступном диске K:, потому
+# что этот путь существует только на сервере агента. Свежий отчёт агента является
+# источником истины для локальных файлов назначенной базы.
+foreach($dashboardJob in $jobs){
+    $assignedId=[string]$dashboardJob.AgentId
+    $reportingAgent=@($registeredAgents|Where-Object{
+        (($assignedId -and [string]$_.id -eq $assignedId) -or -not $assignedId) -and
+        @($_.report.jobs|Where-Object{[string]$_.name -eq [string]$dashboardJob.Name}).Count -gt 0
+    }|Sort-Object{try{[datetime]$_.lastSeen}catch{[datetime]::MinValue}} -Descending|Select-Object -First 1)
+    if(-not $reportingAgent.Count){
+        $reportingAgent=@($registeredAgents|Where-Object{
+            @($_.report.jobs|Where-Object{[string]$_.name -eq [string]$dashboardJob.Name}).Count -gt 0
+        }|Sort-Object{try{[datetime]$_.lastSeen}catch{[datetime]::MinValue}} -Descending|Select-Object -First 1)
+    }
+    if(-not $reportingAgent.Count){continue}
+
+    $remoteJob=@($reportingAgent[0].report.jobs|Where-Object{[string]$_.name -eq [string]$dashboardJob.Name}|Select-Object -First 1)
+    if(-not $remoteJob.Count){continue}
+    $remote=$remoteJob[0]
+    if(-not [string]::IsNullOrWhiteSpace([string]$remote.localPath)){$dashboardJob.LocalPath=[string]$remote.localPath}
+    $dashboardJob.LocalFile=[string]$remote.latestFile
+    $dashboardJob.LocalSizeBytes=[Int64]$remote.latestSizeBytes
+    $dashboardJob.LocalFileCount=[int]$remote.fileCount
+    $dashboardJob.LocalTotalBytes=[Int64]$remote.totalBytes
+    $dashboardJob.LocalLastWrite=$remote.latestWriteTime
+    $dashboardJob.LocalObjects=@($remote.files|ForEach-Object{[PSCustomObject]@{
+        Name=[string]$_.name;FullName=[string]$_.fullName;SizeBytes=[Int64]$_.sizeBytes;LastWriteTime=$_.lastWriteTime
+    }})
+    $dashboardJob.LastChecked=$reportingAgent[0].report.generatedAt
+
+    if(-not [bool]$remote.available){
+        $dashboardJob.Status='ERROR';$dashboardJob.HealthScore=0;$dashboardJob.ReasonCodes=@('ERROR')
+        $dashboardJob.StatusText=if($remote.error){[string]$remote.error}else{'Локальный каталог недоступен на агенте'}
+        continue
+    }
+    if([int]$remote.fileCount -le 0){
+        $dashboardJob.Status='WAITING';$dashboardJob.HealthScore=0;$dashboardJob.ReasonCodes=@('WAITING_FILE')
+        $dashboardJob.StatusText='Агент подключён, подходящие локальные backup-файлы не найдены'
+        continue
+    }
+
+    try{$dashboardJob.AgeHours=[math]::Round(((Get-Date)-[datetime]$remote.latestWriteTime).TotalHours,2)}catch{$dashboardJob.AgeHours=$null}
+    $latestName=[string]$remote.latestFile
+    $latestOnS3=@($dashboardJob.S3Objects|Where-Object{
+        $key=[string]$_.Key;($key -split '[/\\]')[-1] -eq $latestName
+    }).Count -gt 0
+    if($latestOnS3){
+        $dashboardJob.Status='OK';$dashboardJob.SyncStatus='SYNCED';$dashboardJob.HealthScore=100;$dashboardJob.ReasonCodes=@()
+        $dashboardJob.StatusText='Локальная копия и последний объект S3 синхронизированы'
+    }else{
+        $dashboardJob.Status='READY';$dashboardJob.SyncStatus='S3_MISSING';$dashboardJob.HealthScore=70;$dashboardJob.ReasonCodes=@('S3_MISSING')
+        $dashboardJob.StatusText='Новая локальная копия обнаружена агентом и ещё не загружена на S3'
+    }
+}
+$registeredAgentGroupPayload=@($registeredAgents|ForEach-Object{
+    $online=$false
+    try{$online=((Get-Date)-[datetime]$_.lastSeen).TotalSeconds-lt45}catch{}
+    [ordered]@{
+        id=[string]$_.id
+        displayName=if([string]::IsNullOrWhiteSpace([string]$_.displayName)){[string]$_.host}else{[string]$_.displayName}
+        host=if([string]::IsNullOrWhiteSpace([string]$_.host)){[string]$_.expectedAddress}else{[string]$_.host}
+        ip=[string]$_.expectedAddress
+        version=if([string]::IsNullOrWhiteSpace([string]$_.version)){'Agent —'}else{'Agent '+[string]$_.version}
+        online=$online
+    }
+})
+$registeredAgentGroupsJson=ConvertTo-Json -InputObject $registeredAgentGroupPayload -Compress -Depth 4
+if([string]::IsNullOrWhiteSpace($registeredAgentGroupsJson)){$registeredAgentGroupsJson='[]'}
+
 $history = @()
 $historyFile = Resolve-LocalConfigPath $config.Global.HistoryFile
 if (Test-Path $historyFile) {
@@ -286,12 +370,12 @@ function New-SparklineSvg {
 
 $total = $jobs.Count
 $ok = @($jobs | Where-Object {
-    $_.Status -in @("OK","UPLOADED","READY") -and
+    $_.Status -in @("OK","UPLOADED") -and
     -not ([int]$_.S3ObjectCount -gt [int]$_.Keep)
 }).Count
 
 $waiting = @($jobs | Where-Object {
-    $_.Status -eq "WAITING" -or
+    $_.Status -in @("WAITING","READY") -or
     (
         $_.Status -in @("OK","UPLOADED","READY") -and
         [int]$_.S3ObjectCount -gt [int]$_.Keep
@@ -540,6 +624,31 @@ $rows = New-Object System.Text.StringBuilder
 foreach ($entry in $displayJobs) {
     $job=$entry.Job
     $jobUi=$entry.Ui
+    $assignedAgentId=[string]$job.AgentId
+    $matchedAgent=@($registeredAgents|Where-Object{$assignedAgentId -and [string]$_.id -eq $assignedAgentId}|Select-Object -First 1)
+    if(-not $matchedAgent.Count){
+        $matchedAgent=@($registeredAgents|Where-Object{@($_.report.jobs|Where-Object{[string]$_.name -eq [string]$job.Name}).Count -gt 0}|Select-Object -First 1)
+    }
+    $agentRecord=if($matchedAgent.Count){$matchedAgent[0]}else{$null}
+    $effectiveAgentId=if($null-ne$agentRecord){[string]$agentRecord.id}else{$assignedAgentId}
+    $agentJob=if($null-ne$agentRecord){@($agentRecord.report.jobs|Where-Object{[string]$_.name -eq [string]$job.Name}|Select-Object -First 1)}else{@()}
+    if($agentJob.Count){
+        $remote=$agentJob[0]
+        if(-not [string]::IsNullOrWhiteSpace([string]$remote.localPath)){$job.LocalPath=[string]$remote.localPath}
+        $job.LocalFile=[string]$remote.latestFile
+        $job.LocalSizeBytes=[Int64]$remote.latestSizeBytes
+        $job.LocalFileCount=[int]$remote.fileCount
+        $job.LocalTotalBytes=[Int64]$remote.totalBytes
+        $job.LocalLastWrite=$remote.latestWriteTime
+        $job.LastChecked=$agentRecord.report.generatedAt
+        if(-not [bool]$remote.available){$job.Status='ERROR';$job.StatusText=if($remote.error){[string]$remote.error}else{'Локальный каталог недоступен на агенте'}}
+    }
+    $agentHost=if($null-ne$agentRecord){[string]$agentRecord.host}elseif(-not [string]::IsNullOrWhiteSpace([string]$job.AgentHost)){[string]$job.AgentHost}else{[string]$state.Host}
+    if([string]::IsNullOrWhiteSpace($agentHost)){$agentHost=[string]$env:COMPUTERNAME}
+    $agentName=if($null-ne$agentRecord -and -not [string]::IsNullOrWhiteSpace([string]$agentRecord.displayName)){[string]$agentRecord.displayName}elseif(-not [string]::IsNullOrWhiteSpace([string]$job.AgentName)){[string]$job.AgentName}else{$agentHost}
+    $agentVersion=if($null-ne$agentRecord){"Agent "+[string]$agentRecord.version}elseif(-not [string]::IsNullOrWhiteSpace([string]$job.AgentVersion)){[string]$job.AgentVersion}else{"Локальный"}
+    $agentOnline=if($null-ne$agentRecord){try{((Get-Date)-[datetime]$agentRecord.lastSeen).TotalSeconds-lt45}catch{$false}}elseif($null -ne $job.AgentOnline){[bool]$job.AgentOnline}else{$true}
+    $agentLastSeen=if($null-ne$agentRecord){Format-DateValue $agentRecord.lastSeen}elseif($null -ne $job.AgentLastSeen){Format-DateValue $job.AgentLastSeen}else{"Сейчас"}
 
     # v21.33: State from an older controller run may still say OK while the
     # already-known S3 inventory clearly exceeds Keep. The Dashboard must not
@@ -621,12 +730,13 @@ foreach ($entry in $displayJobs) {
     [void]$rows.AppendLine(@"
 <tr class="db-row accent-$(ConvertTo-HtmlSafe $jobUi.Accent) $(if($jobUi.Pinned){'pinned-row'}else{''})" draggable="true"
     data-db="$(ConvertTo-HtmlSafe $job.Name)"
+    data-agent-id="$(ConvertTo-HtmlSafe $effectiveAgentId)"
     data-status="$(ConvertTo-HtmlSafe $job.Status)"
     data-pinned="$(if($jobUi.Pinned){'1'}else{'0'})"
     data-priority="$(ConvertTo-HtmlSafe $jobUi.Priority)"
     data-age="$([double]$job.AgeHours)"
     data-size="$([Int64]$job.LocalSizeBytes)"
-    data-search="$(ConvertTo-HtmlSafe (($job.Name + ' ' + $jobUi.Alias + ' ' + $jobUi.Group + ' ' + $job.Bucket + ' ' + $job.S3Path + ' ' + $job.LocalFile).ToLower()))">
+    data-search="$(ConvertTo-HtmlSafe (($job.Name + ' ' + $jobUi.Alias + ' ' + $jobUi.Group + ' ' + $agentHost + ' ' + $agentName + ' ' + $job.Bucket + ' ' + $job.S3Path + ' ' + $job.LocalFile).ToLower()))">
     <td class="db">
         <div class="db-name db-hover-target"
              data-next="$(ConvertTo-HtmlSafe $nextExpectedIso)"
@@ -648,11 +758,17 @@ foreach ($entry in $displayJobs) {
         </div>
         $(if(-not [string]::IsNullOrWhiteSpace([string]$jobUi.Note)){"<div class='db-note'>$(ConvertTo-HtmlSafe $jobUi.Note)</div>"}else{""})
         <div class="db-actions">
-            <button class="check-job" type="button" data-job="$(ConvertTo-HtmlSafe $job.Name)" title="Проверить только эту базу">Проверить</button>
+            <button class="check-job" type="button" data-job="$(ConvertTo-HtmlSafe $job.Name)" data-agent-id="$(ConvertTo-HtmlSafe $effectiveAgentId)" title="Проверить только эту базу">Проверить</button>
             <button class="maintenance-job" type="button" data-job="$(ConvertTo-HtmlSafe $job.Name)" data-active="$(if($job.Status -eq 'MAINTENANCE'){'1'}else{'0'})">$(if($job.Status -eq 'MAINTENANCE'){'Возобновить'}else{'Пауза 2ч'})</button>
             <button class="retention-job" type="button" data-job="$(ConvertTo-HtmlSafe $job.Name)">Очистка</button>
             <button class="delete-job" type="button" data-job="$(ConvertTo-HtmlSafe $job.Name)" title="Удалить базу">Удалить</button>
         </div>
+    </td>
+    <td class="agent-cell">
+        <div class="agent-state $(if($agentOnline){'online'}else{'offline'})"><span class="agent-dot" aria-hidden="true"></span>$(if($agentOnline){'Подключён'}else{'Нет связи'})</div>
+        <div class="agent-name">$(ConvertTo-HtmlSafe $agentName)</div>
+        <div class="muted">Host: $(ConvertTo-HtmlSafe $agentHost)</div>
+        <div class="muted">$(ConvertTo-HtmlSafe $agentVersion) · $(ConvertTo-HtmlSafe $agentLastSeen)</div>
     </td>
     <td>
         <span class="status $statusClass">$(ConvertTo-HtmlSafe (Get-StatusLabel $job.Status))</span>
@@ -1865,6 +1981,12 @@ html[data-theme="light"] #recentEventTooltip{
     .update-progress-track{height:9px;overflow:hidden;border-radius:999px;background:#202b35}
     .update-progress-fill{width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,#248fd4,#48d69b);transition:width .25s ease}
     .update-progress-details{margin-top:7px;color:#8299aa;font-size:10px}
+    .install-update-button{width:100%;margin-top:12px;min-height:40px;font-weight:800;background:linear-gradient(135deg,#1577ad,#1e9b75);border-color:#45bce8;box-shadow:0 8px 24px rgba(23,139,190,.18)}
+    .update-channel-card{display:grid;grid-template-columns:46px minmax(0,1fr) auto;align-items:center;gap:12px;margin:12px 0;padding:13px;border:1px solid #304151;border-radius:11px;background:linear-gradient(135deg,#101820,#121d27);box-shadow:inset 0 1px rgba(255,255,255,.025)}
+    .update-channel-icon{display:grid;place-items:center;width:44px;height:44px;border:1px solid #4389b5;border-radius:12px;background:#0b1118;color:#54c4ff;font-weight:900;letter-spacing:-1px;box-shadow:0 0 18px rgba(63,178,236,.14)}
+    .update-channel-content{display:grid;gap:3px;min-width:0}.update-channel-content strong{color:#e3edf7}.update-channel-content span{color:#8499ad;font-size:11px}.update-channel-content input{margin-top:6px;width:100%;background:#0b1117;border-color:#34495b;color:#bfe8ff;font-family:Consolas,monospace}
+    .update-channel-badge{align-self:start;padding:4px 8px;border:1px solid #267e5c;border-radius:999px;background:rgba(35,137,95,.18);color:#71dbab;font-size:10px;font-weight:800}
+    html[data-theme="light"] .update-channel-card{background:linear-gradient(135deg,#f6f9fc,#edf5fa)}html[data-theme="light"] .update-channel-content input{background:#fff;color:#24435a}
 
 </style>
 <style>
@@ -2278,9 +2400,9 @@ html[data-theme="light"] #recentEventTooltip{
             <div class="title-row">
                 <div id="dashboardBrand" class="dashboard-brand" role="button" tabindex="0" aria-label="BackupS3 Dashboard. Показать или скрыть служебную панель" title="Показать или скрыть Диагностику и обновление Dashboard">
                     <div class="dashboard-brand-symbol" aria-hidden="true"><img src="BackupS3-Login.png" alt=""></div>
-                    <div class="dashboard-brand-title"><h1>Backup<strong>S3</strong></h1><em>Dashboard</em></div>
+                    <div class="dashboard-brand-title"><h1>Backup<strong>S3</strong></h1><em>Manager</em></div>
                 </div>
-                <button id="restartDashboardButton" type="button" class="restart-dashboard-button" title="Полностью перезапустить Dashboard Server">Перезапустить</button>
+                <button id="restartDashboardButton" type="button" class="restart-dashboard-button" title="Перезапустить интерфейс BackupS3"><span aria-hidden="true">&#8635;</span> Обновить интерфейс</button>
             </div>
             <p>Host: <strong>$(ConvertTo-HtmlSafe $state.Host)</strong> · Обновлено: <strong id="generatedAt">$(ConvertTo-HtmlSafe $generated)</strong></p>
         </div>
@@ -2298,6 +2420,8 @@ html[data-theme="light"] #recentEventTooltip{
             </div>
             <button id="logButton" type="button" class="log-button header-log-button" title="Живой лог BackupS3">Log</button>
             <button id="reportButton" type="button" class="settings-button" title="Сформировать отчёт">Отчёт</button>
+            <button id="s3ExplorerButton" type="button" class="settings-button" title="Просмотреть подключённые S3-хранилища">S3‑проводник</button>
+            <button id="agentsButton" type="button" class="settings-button" title="Подключённые серверные агенты">Агенты</button>
             <button id="profilesButton" type="button" class="settings-button" title="Профили баз и подключения S3">Профили и S3</button>
             <button id="settingsButton" type="button" class="settings-button" title="Настройки">⚙ Настройки</button>
             <button id="themeToggle" type="button" class="theme-toggle" title="Переключить тему">
@@ -2329,7 +2453,7 @@ html[data-theme="light"] #recentEventTooltip{
             <option value="">Все статусы</option>
             <option value="OK">В норме</option>
             <option value="UPLOADED">Загружено</option>
-            <option value="READY">Готово</option>
+            <option value="READY">Ожидает загрузки</option>
             <option value="WAITING">Ожидание</option>
             <option value="STALE">Устарело</option>
             <option value="ERROR">Ошибка</option>
@@ -2478,6 +2602,13 @@ html[data-theme="light"] #recentEventTooltip{
 
             <div id="serverVersionWarning" class="server-version-warning" hidden></div>
             <form id="addJobForm">
+                <div class="agent-assignment-field">
+                    <label>
+                        <span>Сервер проверки <i class="field-help" data-help="Локально — проверка выполняется Manager. При выборе агента локальная папка проверяется на указанном удалённом сервере, в том числе автоматически.">?</i></span>
+                        <select id="editAgentId"><option value="">Этот компьютер (Manager)</option></select>
+                        <small class="field-hint">Выберите Manager для локальной папки или подключённый агент для папки на удалённом сервере.</small>
+                    </label>
+                </div>
                 <div class="form-grid">
                     <label>
                         <span>Имя базы <i class="field-help" data-help="Название базы в BackupS3 Manager.">?</i></span>
@@ -2928,6 +3059,16 @@ html[data-theme="light"] #recentEventTooltip{
                 </div>
 
                 <div class="settings-section">
+                    <h3>Отображение списка баз</h3>
+                    <div class="database-view-options" id="databaseViewOptions">
+                        <label class="database-view-option"><input type="radio" name="databaseViewMode" value="compact"><span><strong>A — Компактная таблица</strong><small>Сервер и агент находятся непосредственно возле каждой базы.</small></span></label>
+                        <label class="database-view-option"><input type="radio" name="databaseViewMode" value="grouped"><span><strong>B — Группировка по серверам</strong><small>Сначала сервер и состояние агента, затем все его базы.</small></span></label>
+                        <label class="database-view-option"><input type="radio" name="databaseViewMode" value="tree"><span><strong>C — Раскрываемое дерево</strong><small>Группы серверов можно сворачивать и раскрывать.</small></span></label>
+                    </div>
+                    <div class="settings-inline-note">Режим применяется сразу и сохраняется в текущем профиле интерфейса.</div>
+                </div>
+
+                <div class="settings-section">
                     <h3>Обновления BackupS3</h3>
                     <div class="setting-row">
                         <div><strong>Установленная версия</strong><p id="settingsCurrentVersion">Определяю версию…</p></div>
@@ -2936,12 +3077,17 @@ html[data-theme="light"] #recentEventTooltip{
                             <button id="downloadUpdateButton" type="button" class="primary-button" hidden>Скачать обновление</button>
                         </div>
                     </div>
-                    <label class="accent-field"><span>Канал обновлений GitHub</span><input id="settingUpdateManifestUrl" type="url" placeholder="https://github.com/…/releases/latest/download/manifest.json"></label>
+                    <div class="update-channel-card">
+                        <div class="update-channel-icon" aria-hidden="true">GH</div>
+                        <label class="update-channel-content"><strong>Канал обновлений GitHub</strong><span>Официальный манифест BackupS3 Manager</span><input id="settingUpdateManifestUrl" type="url" placeholder="https://github.com/…/releases/latest/download/manifest.json"></label>
+                        <span class="update-channel-badge">Авто</span>
+                    </div>
                     <div id="updateCheckStatus" class="settings-inline-note">Нажмите «Проверить обновления».</div>
                     <div id="updateDownloadProgress" class="update-download-progress" hidden>
                         <div class="update-progress-head"><strong id="updateProgressTitle">Скачивание обновления</strong><span id="updateProgressPercent">0%</span></div>
                         <div class="update-progress-track"><div id="updateProgressFill" class="update-progress-fill"></div></div>
                         <div id="updateProgressDetails" class="update-progress-details">0 Б из 0 Б</div>
+                        <button id="installUpdateButton" type="button" class="primary-button install-update-button" hidden>Установить обновление</button>
                     </div>
                 </div>
 
@@ -2982,8 +3128,9 @@ html[data-theme="light"] #recentEventTooltip{
 
     <div id="profilesModal" class="modal-backdrop" hidden>
         <div class="modal-card profiles-manager-card">
-            <div class="modal-head">
-                <div><h2>Профили конфигурации и S3</h2><p>Сохраняйте наборы баз и управляйте учётными данными AWS CLI.</p><span id="activeWorkspaceBadge" class="endpoint">Текущая конфигурация: …</span></div>
+            <div class="modal-head profiles-modal-head">
+                <div><h2>Профили конфигурации и S3</h2><p>Сохраняйте наборы баз и управляйте учётными данными AWS CLI.</p></div>
+                <span id="activeWorkspaceBadge" class="endpoint active-workspace-badge">Текущая конфигурация: …</span>
                 <button id="closeProfilesModal" class="icon-button" type="button">×</button>
             </div>
             <div class="profiles-manager-grid">
@@ -2997,9 +3144,14 @@ html[data-theme="light"] #recentEventTooltip{
                 <section class="manager-panel">
                     <h3>S3-профили</h3>
                     <p class="muted">Хранятся в стандартном файле AWS CLI. Секреты скрыты до нажатия «Показать».</p>
+                    <div id="awsRuntimeCard" class="aws-runtime-card">
+                        <div><strong id="awsRuntimeTitle">Проверка компонентов…</strong><p id="awsRuntimeText">Проверяем AWS CLI v2 и Python.</p></div>
+                        <div class="manager-actions"><button id="checkAwsRuntime" type="button">Проверить</button><button id="installAwsRuntime" class="primary-button" type="button" hidden>Установить AWS CLI v2</button></div>
+                    </div>
                     <div id="s3ProfilesList" class="manager-list"></div>
                     <form id="s3ProfileForm" class="s3-profile-form">
                         <input id="s3ProfileName" required maxlength="80" placeholder="Имя профиля">
+                        <input id="s3DisplayName" maxlength="80" placeholder="Понятное название, например: Резервные копии бухгалтерии">
                         <input id="s3AccessKey" autocomplete="off" placeholder="Access Key ID">
                         <div class="secret-input"><input id="s3SecretKey" type="password" autocomplete="new-password" placeholder="Secret Access Key"><button class="toggle-secret" type="button" data-target="s3SecretKey">Показать</button></div>
                         <div class="secret-input"><input id="s3SessionToken" type="password" autocomplete="new-password" placeholder="Session Token (необязательно)"><button class="toggle-secret" type="button" data-target="s3SessionToken">Показать</button></div>
@@ -3013,7 +3165,64 @@ html[data-theme="light"] #recentEventTooltip{
         </div>
     </div>
 
+    <div id="s3ExplorerModal" class="modal-backdrop" hidden>
+        <div class="modal-card s3-explorer-card">
+            <div class="modal-head">
+                <div><h2>S3‑проводник</h2><p>Безопасный просмотр бакетов, папок и файлов подключённых профилей.</p></div>
+                <button id="closeS3Explorer" class="icon-button" type="button">×</button>
+            </div>
+            <div class="s3-explorer-toolbar">
+                <select id="s3ExplorerConnection" aria-label="S3-профиль и бакет"><option value="">Выберите подключение…</option></select>
+                <button id="s3ExplorerBack" type="button" title="Назад">←</button>
+                <button id="s3ExplorerUp" type="button" title="На уровень выше">↑</button>
+                <div id="s3ExplorerPath" class="s3-explorer-path">S3 /</div>
+                <input id="s3ExplorerSearch" type="search" placeholder="Поиск в текущей папке…">
+                <input id="s3ExplorerNewFolderName" maxlength="180" placeholder="Название новой папки" hidden>
+                <button id="s3ExplorerCreateFolder" type="button" title="Создать папку в текущем расположении">＋ Папка</button>
+                <button id="s3ExplorerRefresh" class="primary-button" type="button">↻ Обновить</button>
+            </div>
+            <div class="s3-explorer-summary"><span id="s3ExplorerEndpoint">Подключения ещё не загружены</span><span id="s3ExplorerChecked"></span></div>
+            <div class="s3-explorer-table-wrap">
+                <table class="s3-explorer-table">
+                    <thead><tr><th>Имя</th><th>Размер</th><th>Изменён / загружен</th><th>Класс хранения</th><th>Действия</th></tr></thead>
+                    <tbody id="s3ExplorerRows"><tr><td colspan="5" class="s3-explorer-empty">Выберите профиль и бакет.</td></tr></tbody>
+                </table>
+            </div>
+            <div id="s3ExplorerError" class="form-error"></div>
+        </div>
+    </div>
+
     <style>
+        .s3-explorer-card{width:min(1180px,94vw);height:min(760px,90vh);display:flex;flex-direction:column;overflow:hidden}
+        .s3-explorer-toolbar{display:grid;grid-template-columns:minmax(230px,320px) 42px 42px minmax(180px,1fr) minmax(180px,250px) auto auto;gap:8px;align-items:center;margin:14px 0 10px}
+        .s3-explorer-toolbar select,.s3-explorer-toolbar input,.s3-explorer-toolbar button{min-height:40px}
+        .s3-explorer-path{min-width:0;padding:10px 12px;border:1px solid #344353;border-radius:8px;background:#0d131a;color:#d8e8f8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:Consolas,monospace}
+        .s3-explorer-summary{display:flex;justify-content:space-between;gap:16px;padding:0 2px 10px;color:#8fa7bf;font-size:12px}
+        .s3-explorer-table-wrap{flex:1;min-height:260px;overflow:auto;border:1px solid #303b49;border-radius:10px;background:#0c1117}
+        .s3-explorer-table{width:100%;border-collapse:collapse;table-layout:fixed}.s3-explorer-table th{position:sticky;top:0;z-index:1;padding:12px 14px;background:#171e27;color:#aebed0;text-align:left;border-bottom:1px solid #344353}
+        .s3-explorer-table th:nth-child(1){width:44%}.s3-explorer-table th:nth-child(2){width:12%}.s3-explorer-table th:nth-child(3){width:20%}.s3-explorer-table th:nth-child(4){width:12%}.s3-explorer-table th:nth-child(5){width:12%}
+        .s3-explorer-table td{padding:11px 14px;border-bottom:1px solid #222d39;color:#dce8f5;vertical-align:middle}.s3-explorer-table tr:hover td{background:#111d28}
+        .s3-explorer-name{display:flex;align-items:center;gap:10px;min-width:0}.s3-explorer-name span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.s3-explorer-folder{cursor:pointer}.s3-explorer-folder .s3-explorer-icon{color:#f4c755}.s3-explorer-file .s3-explorer-icon{color:#56baff}.s3-explorer-folder:hover .s3-explorer-name span:last-child{color:#69c6ff;text-decoration:underline}.s3-explorer-delete{color:#ff9aa5;border-color:#7b3942;background:#32171c}.s3-explorer-delete:hover{background:#5a2029}.s3-explorer-connection-label{font-weight:700}
+        .s3-explorer-icon{font-size:19px;width:24px;text-align:center}.s3-explorer-muted{color:#8296aa!important}.s3-explorer-empty{text-align:center!important;padding:48px 16px!important;color:#8498ac!important}
+        html[data-theme="light"] .s3-explorer-path,html[data-theme="light"] .s3-explorer-table-wrap{background:#f6f9fc}.s3-explorer-loading{opacity:.65;pointer-events:none}
+        @media(max-width:900px){.s3-explorer-toolbar{grid-template-columns:1fr 42px 42px auto}.s3-explorer-path,.s3-explorer-toolbar input{grid-column:1/-1}.s3-explorer-table th:nth-child(4),.s3-explorer-table td:nth-child(4){display:none}}
+    </style>
+
+    <style>
+        #jobs .agent-cell{min-width:175px;border-left:3px solid #3baeea;background:linear-gradient(90deg,rgba(59,174,234,.07),transparent 55%)}
+        .database-view-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.database-view-option{display:flex;gap:10px;padding:12px;border:1px solid #344353;border-radius:10px;background:#111820;cursor:pointer}.database-view-option:has(input:checked){border-color:#48b8f4;background:#102536;box-shadow:inset 3px 0 #48b8f4}.database-view-option input{margin-top:3px}.database-view-option span{display:grid;gap:4px}.database-view-option small{color:#8fa4b9;line-height:1.35}.database-view-toolbar{display:grid;gap:11px;margin:18px 0}.database-view-tabs{display:flex;gap:9px;flex-wrap:wrap}.database-view-tabs button{padding:10px 15px;border:1px solid #344353;border-radius:9px;background:#131b24;color:#c9d7e6}.database-view-tabs button.active{border-color:#42b7f3;background:#123653;color:#fff;box-shadow:inset 0 0 0 1px rgba(66,183,243,.2)}.database-view-toolbar p{margin:0;color:#8fa7bf}.table-wrap{overflow-x:auto;scrollbar-color:#338fc3 #111820;scrollbar-width:thin}.table-wrap::-webkit-scrollbar{height:10px}.table-wrap::-webkit-scrollbar-track{background:#111820;border-radius:10px}.table-wrap::-webkit-scrollbar-thumb{background:linear-gradient(90deg,#277eae,#45bdf4);border-radius:10px;border:2px solid #111820}.server-group-row td{padding:0!important;border:0!important;background:#0b1118!important}.server-group-card{display:grid;grid-template-columns:auto minmax(190px,1.1fr) repeat(3,minmax(95px,.48fr)) minmax(360px,1fr);align-items:center;gap:14px;margin:12px 0 5px;padding:14px 16px;border:1px solid #344353;border-left:4px solid #44b7f2;border-radius:10px;background:linear-gradient(100deg,#152330,#111820 60%);min-width:0}.server-group-main{min-width:0}.server-group-title{display:flex;align-items:center;gap:10px;font-weight:750;color:#edf7ff}.server-group-meta{display:flex;gap:8px;flex-wrap:wrap;color:#91a7bc;font-size:12px;margin-top:5px}.server-group-stat{display:grid;gap:4px;color:#91a7bc;font-size:12px}.server-group-stat strong{color:#edf7ff;font-size:13px}.server-group-actions{display:grid;grid-template-columns:minmax(150px,1fr) auto auto;gap:8px;align-items:center}.server-group-target{min-width:0;height:36px;padding:0 10px;border:1px solid #344b5e;border-radius:8px;background:#0d1720;color:#dcecf8}.server-group-action,.server-group-move{height:36px;padding:0 13px!important;border:1px solid #3188b8!important;border-radius:8px!important;background:linear-gradient(180deg,#174866,#12354b)!important;color:#e9f8ff!important;font-weight:650;white-space:nowrap;box-shadow:inset 0 1px rgba(255,255,255,.05);transition:.18s ease}.server-group-action:hover,.server-group-move:hover{background:linear-gradient(180deg,#1d5c80,#16435e)!important;transform:translateY(-1px)}.server-group-action:disabled,.server-group-move:disabled{opacity:.7;transform:none}.server-group-move{border-color:#3b7d69!important;background:linear-gradient(180deg,#185744,#123c31)!important}.server-group-toggle{width:32px;height:32px;min-width:32px;padding:0!important;display:grid;place-items:center;border-radius:50%!important;border:1px solid #337fa8!important;background:#102c3e!important;color:#66c9ff!important;font-size:16px;transition:.18s ease}.server-group-toggle:hover{background:#174867!important;box-shadow:0 0 0 3px rgba(66,183,243,.12)}.server-group-row[data-online="1"] .server-group-title::before{content:'●';color:#56d99a}.server-group-row[data-online="0"] .server-group-title::before{content:'●';color:#ff7d88}#jobs[data-view-mode="grouped"] .db-row .agent-cell,#jobs[data-view-mode="tree"] .db-row .agent-cell{opacity:.55}#jobs .db-row.view-collapsed{display:none!important}
+        .server-group-row>td{position:relative!important;left:auto!important;z-index:6;padding:0!important}.server-group-card{position:relative!important;left:auto!important;width:calc(var(--database-viewport-width,100vw) - 4px);max-width:calc(var(--database-viewport-width,100vw) - 4px);box-sizing:border-box;will-change:transform}
+        .server-cards{display:grid;gap:10px;margin:0 0 12px;position:relative;z-index:7}.server-cards:empty{display:none}.server-cards .server-group-row{display:block}.server-cards .server-group-card{width:100%!important;max-width:none!important;margin:0;transform:none!important;will-change:auto;grid-template-columns:auto minmax(240px,1.35fr) repeat(3,minmax(120px,.55fr)) auto}.server-agent-ip{color:#65c8ff!important}.server-cards .server-group-actions{display:flex;justify-content:flex-end}.server-cards .server-group-action{min-width:158px}
+        @media(max-width:850px){.database-view-options{grid-template-columns:1fr}}
+        #jobs .agent-state{display:inline-flex;align-items:center;gap:6px;margin-bottom:6px;color:#68dca4;font-size:11px;font-weight:700}
+        #jobs .agent-state.offline{color:#ff7d88}
+        #jobs .agent-dot{width:8px;height:8px;border-radius:50%;background:#43d692;box-shadow:0 0 8px rgba(67,214,146,.65)}
+        #jobs .agent-state.offline .agent-dot{background:#ff6977;box-shadow:none}
+        #jobs .agent-name{color:#edf5ff;font-weight:700;margin-bottom:3px}
+        html[data-theme="light"] #jobs .agent-cell{background:linear-gradient(90deg,rgba(41,145,203,.09),transparent 55%)}
+        html[data-theme="light"] .database-view-option{background:#f7fafc;border-color:#c8d3de}html[data-theme="light"] .database-view-option:has(input:checked){background:#eaf6fd;border-color:#2996d0}html[data-theme="light"] .database-view-tabs button{background:#f6f9fc;color:#304457;border-color:#c5d1dc}html[data-theme="light"] .database-view-tabs button.active{background:#dff2fc;color:#13577d;border-color:#2996d0}html[data-theme="light"] .server-group-card{background:linear-gradient(100deg,#eaf6fd,#f6f9fc 55%);border-color:#bfcedb}html[data-theme="light"] .server-group-title{color:#1c2c3a}html[data-theme="light"] .server-group-toggle{background:#e3f4fd!important;color:#1876a8!important;border-color:#69b9e1!important}
+        html[data-theme="light"] #jobs .agent-name{color:#1d2a38}
+
         .startup-workspace-card{max-width:560px;padding:28px;background:#171d25;border:1px solid #344353;border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.58);text-align:center}
         .startup-workspace-brand{width:82px;height:82px;margin:0 auto 10px;overflow:hidden;border-radius:20px;box-shadow:0 0 24px rgba(58,174,255,.24)}
         .startup-workspace-brand img{display:block;width:100%;height:100%;object-fit:cover}
@@ -3054,15 +3263,50 @@ html[data-theme="light"] #recentEventTooltip{
         </div>
     </div>
 
+    <style>
+        .agents-card{width:min(760px,94vw);max-height:86vh;overflow:auto}
+        .agents-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+        .agents-head-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.agents-head .modal-close{position:static;margin:0;width:36px;height:36px}
+        .agents-code{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;border:1px solid #344353;border-radius:10px;background:#10161e}
+        .agents-create{display:grid;grid-template-columns:1.2fr 1fr 170px;gap:8px;align-items:end;margin-top:12px;padding:12px;border:1px solid #344353;border-radius:10px;background:#10161e}.agents-create label:nth-child(4){grid-column:1/3}
+        .agents-create label{display:grid;gap:5px;font-size:12px;color:#94a8bd}.agents-create input{min-width:0}.agents-create input[inputmode="decimal"]{font-family:Consolas,"Cascadia Mono",monospace;letter-spacing:.35px}.manager-ip-wrap{display:grid;grid-template-columns:1fr auto;align-items:center}.manager-ip-wrap input{border-radius:6px 0 0 6px}.manager-ip-port{height:100%;display:flex;align-items:center;padding:0 11px;border:1px solid #465463;border-left:0;border-radius:0 6px 6px 0;background:#19222c;color:#9fb4c9;font-family:Consolas,monospace}.agent-net{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}.agent-net .ok{color:#68dca4}.agent-net .bad{color:#ff7d88}
+        .agents-code code{color:#71ceff;font-size:17px;letter-spacing:1px}.agents-list{display:grid;gap:10px;margin-top:14px}
+        .agent-panel{padding:13px;border:1px solid #344353;border-radius:10px;background:#121920}
+        .agent-panel-top{display:flex;justify-content:space-between;gap:12px}.agent-panel strong{color:#eef6ff}.agent-panel small{display:block;color:#94a8bd;margin-top:4px}
+        .agent-panel-status{color:#68dca4}.agent-panel-status.offline{color:#ff7d88}.agent-panel-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap;justify-content:flex-end}.agent-delete{padding:5px 9px;border-color:#82404a!important;color:#ff9aa3!important;background:#321a20!important}
+        html[data-theme="light"] .agents-code,html[data-theme="light"] .agent-panel{background:#f6f9fc;border-color:#c8d3de}
+        html[data-theme="light"] .agent-panel strong{color:#1d2a38}
+    </style>
+    <div id="agentsModal" class="modal-backdrop" hidden>
+        <div class="modal-card agents-card">
+            <div class="agents-head"><div><h2>BackupS3 Agents</h2><p class="muted">Manager опрашивает сервер по IP, а агент отправляет подробный отчёт обратным heartbeat.</p></div><div class="agents-head-actions"><button id="agentsRefresh" type="button" class="settings-button">↻ Обновить агентов</button><button id="agentsClose" type="button" class="modal-close" aria-label="Закрыть">×</button></div></div>
+            <div class="agents-code"><span>Код подключения:</span><code id="agentsEnrollmentCode">—</code><button id="agentsCopyCode" type="button" class="settings-button">Копировать код</button><span class="muted" id="agentsManagerAddress"></span><button id="agentsRotateCode" type="button" class="settings-button">Новый код</button></div>
+            <form id="agentsCreate" class="agents-create"><label>Название сервера<input id="agentCreateName" required placeholder="Например: ANIKET"></label><label>IP сервера с агентом<input id="agentCreateAddress" required inputmode="decimal" autocomplete="off" placeholder="10.24.24.198"></label><label>Порт агента<input id="agentCreatePort" type="number" min="1024" max="65535" value="17832"></label><label>IP Manager для обратной связи<span class="manager-ip-wrap"><input id="agentManagerIp" required inputmode="decimal" autocomplete="off" placeholder="10.24.24.10"><span class="manager-ip-port">:17831</span></span></label><input id="agentManagerUrl" type="hidden"><button class="settings-button" type="submit">↓ Создать и скачать</button></form>
+            <div id="agentsList" class="agents-list"><div class="muted">Загружаю список агентов…</div></div>
+        </div>
+    </div>
+
     <div id="floatingHeader" class="floating-header" hidden>
         <div id="floatingHeaderInner" class="floating-header-inner"></div>
     </div>
+
+    <div class="database-view-toolbar" id="databaseViewToolbar">
+        <div class="database-view-tabs" role="tablist" aria-label="Вид списка баз">
+            <button type="button" data-view="compact">A · Компактная</button>
+            <button type="button" data-view="grouped">B · По серверам</button>
+            <button type="button" data-view="tree">C · Дерево</button>
+        </div>
+        <p id="databaseViewDescription">Сервер и состояние агента видны прямо в каждой строке базы.</p>
+    </div>
+
+    <div id="serverCards" class="server-cards" aria-label="Подключённые серверы и агенты"></div>
 
     <section class="table-wrap">
         <table id="jobs">
             <thead>
                 <tr>
                     <th>База</th>
+                    <th>Сервер / агент</th>
                     <th>Статус</th>
                     <th>Комментарий</th>
                     <th>Локальная копия</th>
@@ -3090,7 +3334,8 @@ html[data-theme="light"] #recentEventTooltip{
 
 <script>
 (function () {
-    const statusLabels={OK:'В норме',UPLOADED:'Загружено',READY:'Готово',WAITING:'Ожидание',STALE:'Устарело',WARNING:'Предупреждение',ERROR:'Ошибка',MAINTENANCE:'Обслуживание'};
+    const registeredAgentGroups=$registeredAgentGroupsJson;
+    const statusLabels={OK:'В норме',UPLOADED:'Загружено',READY:'Ожидает загрузки',WAITING:'Ожидание',STALE:'Устарело',WARNING:'Предупреждение',ERROR:'Ошибка',MAINTENANCE:'Обслуживание'};
     const syncStatusLabels={SYNCED:'Синхронизировано',S3_MISSING:'Нет на S3',UNKNOWN:'Не проверено',NOT_CHECKED:'Ещё не проверено'};
     function statusLabel(value){const key=String(value||'').toUpperCase();return statusLabels[key]||value||'Неизвестно';}
     function syncStatusLabel(value){const key=String(value||'').toUpperCase();return syncStatusLabels[key]||value||'Неизвестно';}
@@ -3101,7 +3346,47 @@ html[data-theme="light"] #recentEventTooltip{
     const appDialogMessage=document.getElementById('appDialogMessage');
     const appDialogCancel=document.getElementById('appDialogCancel');
     const appDialogConfirm=document.getElementById('appDialogConfirm');
+    const agentsButton=document.getElementById('agentsButton');
+    const agentsModal=document.getElementById('agentsModal');
+    const agentsClose=document.getElementById('agentsClose');
+    const agentsList=document.getElementById('agentsList');
+    const agentsEnrollmentCode=document.getElementById('agentsEnrollmentCode');
+    const agentsManagerAddress=document.getElementById('agentsManagerAddress');
+    const agentsRotateCode=document.getElementById('agentsRotateCode');
+    const agentsCopyCode=document.getElementById('agentsCopyCode');
+    const agentsRefresh=document.getElementById('agentsRefresh');
+    const agentsCreate=document.getElementById('agentsCreate');
+    const agentManagerIp=document.getElementById('agentManagerIp');
+    const agentManagerUrl=document.getElementById('agentManagerUrl');
+    agentManagerIp.addEventListener('input',()=>{const ip=agentManagerIp.value.trim().replace(/^https?:\/\//i,'').replace(/:17831\/?$/,'');agentManagerUrl.value='http://'+ip+':17831'});
     let appDialogResolve=null;
+
+    function escapeAgentText(value){const div=document.createElement('div');div.textContent=String(value==null?'':value);return div.innerHTML;}
+    async function loadAgents(){
+        const [agentsResponse,enrollmentResponse]=await Promise.all([fetch('/api/agents?t='+Date.now(),{cache:'no-store'}),fetch('/api/agents/enrollment?t='+Date.now(),{cache:'no-store'})]);
+        if(!agentsResponse.ok||!enrollmentResponse.ok)throw new Error('Не удалось получить сведения об агентах.');
+        const data=await agentsResponse.json(),enrollment=await enrollmentResponse.json();
+        agentsEnrollmentCode.textContent=enrollment.code||'—';
+        agentsManagerAddress.textContent=(enrollment.managerHost||location.hostname)+':'+(enrollment.port||17831);
+        const managerIpInput=document.getElementById('agentManagerIp');if(managerIpInput&&!managerIpInput.value)managerIpInput.value=enrollment.managerIp||enrollment.managerHost||location.hostname;agentManagerUrl.value='http://'+managerIpInput.value+':17831';
+        const agents=Array.isArray(data.agents)?data.agents:[];
+        agentsList.innerHTML=agents.length?agents.map(agent=>{
+            const jobs=agent.report&&Array.isArray(agent.report.jobs)?agent.report.jobs.length:0;
+            const address=agent.expectedAddress?(agent.expectedAddress+':'+(agent.probePort||17832)):'не задан';
+            return '<div class="agent-panel"><div class="agent-panel-top"><div><strong>'+escapeAgentText(agent.displayName||agent.host||'Новый агент')+'</strong><small>Host: '+escapeAgentText(agent.host||'ожидает регистрации')+' · Agent '+escapeAgentText(agent.version||'—')+'</small></div><div class="agent-panel-actions"><span class="agent-panel-status '+(agent.online?'':'offline')+'">'+(agent.online?'● Отчёт получен':'● Heartbeat не получен')+'</span><button type="button" class="settings-button agent-delete" data-agent-delete="'+escapeAgentText(agent.id)+'">Удалить</button></div></div><div class="agent-net"><span class="'+(agent.probeOnline?'ok':'bad')+'">'+(agent.probeOnline?'● IP доступен':'● IP недоступен')+': '+escapeAgentText(address)+'</span><span class="muted">Проверено: '+escapeAgentText(agent.probeCheckedAt||'ещё не проверялось')+'</span></div><small>Последняя связь: '+escapeAgentText(agent.lastSeen||'—')+' · Баз в отчёте: '+jobs+' · Код подключения: '+escapeAgentText(agent.enrollmentCodeHint||'—')+'</small></div>';
+        }).join(''):'<div class="muted">Агенты ещё не подключены.</div>';
+    }
+    agentsButton.addEventListener('click',async()=>{agentsModal.hidden=false;document.body.classList.add('modal-open');try{await loadAgents()}catch(e){agentsList.innerHTML='<div class="form-error">'+escapeAgentText(e.message)+'</div>'}});
+    agentsClose.addEventListener('click',()=>{agentsModal.hidden=true;document.body.classList.remove('modal-open')});
+    agentsRefresh.addEventListener('click',async()=>{agentsRefresh.disabled=true;agentsRefresh.textContent='Обновляю…';try{await loadAgents()}finally{agentsRefresh.disabled=false;agentsRefresh.textContent='↻ Обновить агентов'}});
+    agentsList.addEventListener('click',async event=>{const button=event.target.closest('[data-agent-delete]');if(!button)return;const panel=button.closest('.agent-panel');const name=panel?panel.querySelector('strong')?.textContent:'агента';if(!await appConfirm('Удалить «'+name+'» из Manager и отозвать его подключение? Служба на удалённом сервере удалена не будет.',{title:'Удаление агента',confirmText:'Удалить',kind:'danger'}))return;button.disabled=true;const response=await fetch('/api/agents/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:button.dataset.agentDelete})});const result=await response.json().catch(()=>({}));if(!response.ok){await appAlert(result.error||'Не удалось удалить агента.',{title:'Ошибка удаления',kind:'error'});button.disabled=false;return}await loadAgents()});
+    agentsCopyCode.addEventListener('click',async()=>{
+        const code=agentsEnrollmentCode.textContent.trim();if(!code||code==='—')return;
+        try{await navigator.clipboard.writeText(code)}catch(_){const area=document.createElement('textarea');area.value=code;document.body.appendChild(area);area.select();document.execCommand('copy');area.remove()}
+        const old=agentsCopyCode.textContent;agentsCopyCode.textContent='Скопировано ✓';setTimeout(()=>agentsCopyCode.textContent=old,1600);
+    });
+    agentsRotateCode.addEventListener('click',async()=>{if(!await appConfirm('Старый код подключения перестанет работать. Создать новый?',{title:'Новый код агента',confirmText:'Создать'}))return;await fetch('/api/agents/enrollment/rotate',{method:'POST'});await loadAgents();});
+    agentsCreate.addEventListener('submit',async event=>{event.preventDefault();const button=agentsCreate.querySelector('button[type="submit"]');button.disabled=true;button.textContent='Формирую…';try{const payload={displayName:document.getElementById('agentCreateName').value.trim(),address:document.getElementById('agentCreateAddress').value.trim(),port:Number(document.getElementById('agentCreatePort').value||17832),managerUrl:document.getElementById('agentManagerUrl').value.trim()};const response=await fetch('/api/agents/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const result=await response.json();if(!response.ok)throw new Error(result.error||'Не удалось создать агента.');const packageResponse=await fetch('/api/agents/package',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({displayName:payload.displayName,code:result.code,port:payload.port,managerUrl:payload.managerUrl})});if(!packageResponse.ok){const error=await packageResponse.json().catch(()=>({}));throw new Error(error.error||'Не удалось сформировать файл агента.')}const blob=await packageResponse.blob();const disposition=packageResponse.headers.get('Content-Disposition')||'';const match=disposition.match(/filename=([^;]+)/i);const filename=match?match[1].replace(/["']/g,''):'BackupS3Agent.exe';const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=filename;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),30000);agentsEnrollmentCode.textContent=result.code;await appAlert('Персональный агент сформирован и скачан. Перенесите EXE на сервер '+result.address+', запустите и подтвердите установку.',{title:'Агент готов'});const savedManagerUrl=payload.managerUrl;agentsCreate.reset();document.getElementById('agentCreatePort').value='17832';document.getElementById('agentManagerUrl').value=savedManagerUrl;await loadAgents()}catch(error){await appAlert(error.message,{title:'Ошибка создания агента',kind:'error'})}finally{button.disabled=false;button.textContent='↓ Создать и скачать'}});
 
     function finishAppDialog(result){
         if(appDialogBackdrop.hidden)return;
@@ -4121,7 +4406,7 @@ html[data-theme="light"] #recentEventTooltip{
         // Никакого повторного "проигрывания" уже завершённых 19 баз.
         progressLastRenderedCurrent=current;
 
-        progressPercent.textContent = pct + '%';
+        progressPercent.textContent = 'Проверено: ' + pct + '%';
         progressBar.style.width = pct + '%';
         progressCounter.textContent = current + ' / ' + total;
         progressDatabase.textContent = data.database ? '· ' + data.database : '';
@@ -4162,7 +4447,17 @@ html[data-theme="light"] #recentEventTooltip{
         progressPanel.classList.toggle('finished', data.phase === 'FINISHED');
 
         if (data.phase === 'FINISHED') {
-            progressTitle.textContent = 'Последняя проверка завершена';
+            progressTitle.textContent = 'Последняя проверка выполнена';
+            const resultRows=[...document.querySelectorAll('#jobs tr.db-row')];
+            const normal=resultRows.filter(row=>['OK','UPLOADED'].includes(row.dataset.status)).length;
+            const upload=resultRows.filter(row=>row.dataset.status==='READY').length;
+            const waitingNow=resultRows.filter(row=>row.dataset.status==='WAITING').length;
+            const failed=resultRows.filter(row=>['ERROR','STALE','WARNING'].includes(row.dataset.status)).length;
+            const parts=[normal+' в норме'];
+            if(upload)parts.push(upload+' ожидает загрузки');
+            if(waitingNow)parts.push(waitingNow+' ожидает проверки');
+            if(failed)parts.push(failed+' с проблемами');
+            progressMessage.textContent='Результат: '+parts.join(' · ')+' · Проверено '+current+' из '+total+(data.updatedAt?' · '+new Date(data.updatedAt).toLocaleString('ru-RU'):'');
 
             // v21.31: FINISHED — это статический результат, а не активная проверка.
             // Всегда прекращаем частый polling progress.json.
@@ -4595,6 +4890,84 @@ html[data-theme="light"] #recentEventTooltip{
         return data;
     }
 
+    // Read-only S3 explorer. It never exposes credentials and never mutates S3.
+    const s3ExplorerButton=document.getElementById('s3ExplorerButton');
+    const s3ExplorerModal=document.getElementById('s3ExplorerModal');
+    const s3ExplorerConnection=document.getElementById('s3ExplorerConnection');
+    const s3ExplorerRows=document.getElementById('s3ExplorerRows');
+    const s3ExplorerSearch=document.getElementById('s3ExplorerSearch');
+    const s3ExplorerNewFolderName=document.getElementById('s3ExplorerNewFolderName');
+    const s3ExplorerError=document.getElementById('s3ExplorerError');
+    let s3ExplorerCurrent=null;
+    let s3ExplorerPrefix='';
+    let s3ExplorerHistory=[];
+    let s3ExplorerItems=[];
+
+    function s3ExplorerClose(){s3ExplorerModal.hidden=true;document.body.classList.remove('modal-open');}
+    function s3ExplorerPathText(){return 'S3 / '+(s3ExplorerCurrent?s3ExplorerCurrent.bucket:'')+(s3ExplorerPrefix?'/'+s3ExplorerPrefix.replace(/\/$/,''):'');}
+    function s3ExplorerRender(){
+        const query=s3ExplorerSearch.value.trim().toLowerCase();
+        const visible=s3ExplorerItems.filter(x=>!query||x.name.toLowerCase().includes(query));
+        s3ExplorerRows.innerHTML='';
+        visible.forEach(function(item){
+            const row=document.createElement('tr');row.className=item.type==='folder'?'s3-explorer-folder':'s3-explorer-file';
+            const name=document.createElement('td');const wrap=document.createElement('div');wrap.className='s3-explorer-name';
+            const icon=document.createElement('span');icon.className='s3-explorer-icon';icon.textContent=item.type==='folder'?'📁':'▤';
+            const text=document.createElement('span');text.textContent=item.name;wrap.append(icon,text);name.appendChild(wrap);row.appendChild(name);
+            const size=document.createElement('td');size.className='s3-explorer-muted';size.textContent=item.type==='folder'?'—':fmtBytesClient(item.sizeBytes);row.appendChild(size);
+            const date=document.createElement('td');date.className='s3-explorer-muted';date.textContent=item.type==='folder'?'—':fmtDateClient(item.lastModified);row.appendChild(date);
+            const storage=document.createElement('td');storage.className='s3-explorer-muted';storage.textContent=item.type==='folder'?'Папка':(item.storageClass||'—');row.appendChild(storage);
+            const actions=document.createElement('td');
+            if(item.type==='folder'){
+                const open=document.createElement('button');open.type='button';open.textContent='Открыть';open.addEventListener('click',function(e){e.stopPropagation();s3ExplorerOpenPrefix(item.prefix,true);});actions.appendChild(open);
+                row.addEventListener('dblclick',function(){s3ExplorerOpenPrefix(item.prefix,true);});
+            }else{
+                const del=document.createElement('button');del.type='button';del.className='s3-explorer-delete';del.textContent='Удалить';del.addEventListener('click',async function(e){e.stopPropagation();if(!await appConfirm('Удалить файл «'+item.name+'» из S3?\n\nS3://'+s3ExplorerCurrent.bucket+'/'+item.key+'\nЭто действие нельзя отменить.',{title:'Удаление файла S3',confirmText:'Удалить',kind:'danger'}))return;try{del.disabled=true;del.textContent='Удаляю…';await apiJson('/api/s3-explorer/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Profile:s3ExplorerCurrent.profile,Bucket:s3ExplorerCurrent.bucket,Prefix:s3ExplorerPrefix,Key:item.key})});await s3ExplorerOpenPrefix(s3ExplorerPrefix,false);}catch(err){await showAppDialog({title:'Ошибка удаления S3',message:err.message,kind:'error'});}finally{del.disabled=false;del.textContent='Удалить';}});actions.appendChild(del);
+            }
+            row.appendChild(actions);
+            s3ExplorerRows.appendChild(row);
+        });
+        if(!visible.length)s3ExplorerRows.innerHTML='<tr><td colspan="5" class="s3-explorer-empty">'+(query?'Ничего не найдено.':'Папка пуста.')+'</td></tr>';
+    }
+    async function s3ExplorerOpenPrefix(prefix,remember){
+        if(!s3ExplorerCurrent)return;
+        if(remember&&prefix!==s3ExplorerPrefix)s3ExplorerHistory.push(s3ExplorerPrefix);
+        s3ExplorerPrefix=prefix||'';s3ExplorerError.textContent='';s3ExplorerModal.querySelector('.s3-explorer-card').classList.add('s3-explorer-loading');
+        document.getElementById('s3ExplorerPath').textContent=s3ExplorerPathText();
+        try{
+            const c=s3ExplorerCurrent;
+            const data=await apiJson('/api/s3-explorer/list?profile='+encodeURIComponent(c.profile)+'&bucket='+encodeURIComponent(c.bucket)+'&prefix='+encodeURIComponent(s3ExplorerPrefix)+'&t='+Date.now());
+            s3ExplorerItems=[];
+            (data.folders||[]).forEach(x=>s3ExplorerItems.push({type:'folder',name:x.name,prefix:x.prefix}));
+            (data.objects||[]).forEach(x=>s3ExplorerItems.push(Object.assign({type:'file'},x)));
+            s3ExplorerItems.sort((a,b)=>a.type===b.type?a.name.localeCompare(b.name,'ru',{numeric:true}):(a.type==='folder'?-1:1));
+            document.getElementById('s3ExplorerEndpoint').textContent=(data.endpoint||'Стандартный AWS endpoint')+' · '+s3ExplorerItems.length+' элемент(ов)'+(data.isTruncated?' · показаны первые 1000':'' );
+            document.getElementById('s3ExplorerChecked').textContent='Обновлено: '+fmtDateClient(data.checkedAt);
+            s3ExplorerRender();
+        }catch(e){s3ExplorerError.textContent=e.message;s3ExplorerRows.innerHTML='<tr><td colspan="5" class="s3-explorer-empty">Не удалось прочитать S3.</td></tr>';}
+        finally{s3ExplorerModal.querySelector('.s3-explorer-card').classList.remove('s3-explorer-loading');}
+    }
+    async function s3ExplorerLoadConnections(){
+        s3ExplorerConnection.innerHTML='<option value="">Загрузка подключений…</option>';s3ExplorerError.textContent='';
+        const data=await apiJson('/api/s3-explorer/connections?t='+Date.now());s3ExplorerConnection.innerHTML='<option value="">Выберите профиль и бакет…</option>';
+        (data.connections||[]).forEach(function(connection){
+            const label=connection.displayName||connection.profile;
+            if(!connection.ok){const option=document.createElement('option');option.disabled=true;option.textContent=label+' ('+connection.profile+') — ошибка подключения';s3ExplorerConnection.appendChild(option);return;}
+            (connection.buckets||[]).filter(bucket=>!/_s3multipartuploads$/i.test(bucket.name||'')).forEach(function(bucket){const option=document.createElement('option');option.value=JSON.stringify({profile:connection.profile,displayName:label,bucket:bucket.name,endpoint:connection.endpoint||''});option.textContent=label+'  ›  '+bucket.name+(label!==connection.profile?'  ['+connection.profile+']':'');s3ExplorerConnection.appendChild(option);});
+        });
+        if(s3ExplorerConnection.options.length===1)s3ExplorerError.textContent='Доступные бакеты не найдены. Проверьте S3-профили и права list-buckets.';
+    }
+    s3ExplorerButton.addEventListener('click',async function(){s3ExplorerModal.hidden=false;document.body.classList.add('modal-open');try{await s3ExplorerLoadConnections();}catch(e){s3ExplorerError.textContent=e.message;}});
+    document.getElementById('closeS3Explorer').addEventListener('click',s3ExplorerClose);
+    s3ExplorerModal.addEventListener('click',function(e){if(e.target===s3ExplorerModal)s3ExplorerClose();});
+    s3ExplorerConnection.addEventListener('change',function(){if(!this.value)return;s3ExplorerCurrent=JSON.parse(this.value);s3ExplorerPrefix='';s3ExplorerHistory=[];s3ExplorerSearch.value='';s3ExplorerOpenPrefix('',false);});
+    document.getElementById('s3ExplorerRefresh').addEventListener('click',function(){if(s3ExplorerCurrent)s3ExplorerOpenPrefix(s3ExplorerPrefix,false);else s3ExplorerLoadConnections().catch(e=>s3ExplorerError.textContent=e.message);});
+    document.getElementById('s3ExplorerBack').addEventListener('click',function(){if(s3ExplorerHistory.length)s3ExplorerOpenPrefix(s3ExplorerHistory.pop(),false);});
+    document.getElementById('s3ExplorerUp').addEventListener('click',function(){if(!s3ExplorerPrefix)return;const parts=s3ExplorerPrefix.replace(/\/$/,'').split('/');parts.pop();s3ExplorerOpenPrefix(parts.length?parts.join('/')+'/':'',true);});
+    s3ExplorerSearch.addEventListener('input',s3ExplorerRender);
+    document.getElementById('s3ExplorerCreateFolder').addEventListener('click',async function(){if(!s3ExplorerCurrent){s3ExplorerError.textContent='Сначала выберите подключение и бакет.';return;}if(s3ExplorerNewFolderName.hidden){s3ExplorerNewFolderName.hidden=false;s3ExplorerNewFolderName.focus();this.textContent='Создать';return;}const name=s3ExplorerNewFolderName.value.trim();if(!name){s3ExplorerNewFolderName.focus();return;}try{this.disabled=true;await apiJson('/api/s3-explorer/folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Profile:s3ExplorerCurrent.profile,Bucket:s3ExplorerCurrent.bucket,Prefix:s3ExplorerPrefix,Name:name})});s3ExplorerNewFolderName.value='';s3ExplorerNewFolderName.hidden=true;this.textContent='＋ Папка';await s3ExplorerOpenPrefix(s3ExplorerPrefix,false);}catch(e){await showAppDialog({title:'Ошибка создания папки',message:e.message,kind:'error'});}finally{this.disabled=false;}});
+    s3ExplorerNewFolderName.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();document.getElementById('s3ExplorerCreateFolder').click();}else if(e.key==='Escape'){this.value='';this.hidden=true;document.getElementById('s3ExplorerCreateFolder').textContent='＋ Папка';}});
+
     async function loadConfigProfiles(){
         const data=await apiJson('/api/config-profiles?t='+Date.now());
         const list=document.getElementById('configProfilesList');
@@ -4631,7 +5004,29 @@ html[data-theme="light"] #recentEventTooltip{
     }
 
     function clearS3Form(){
-        ['s3ProfileName','s3AccessKey','s3SecretKey','s3SessionToken','s3Region','s3Endpoint'].forEach(function(id){document.getElementById(id).value='';});
+        ['s3ProfileName','s3DisplayName','s3AccessKey','s3SecretKey','s3SessionToken','s3Region','s3Endpoint'].forEach(function(id){document.getElementById(id).value='';});
+    }
+
+    async function loadRuntimeStatus(){
+        const data=await apiJson('/api/runtime/status?t='+Date.now());
+        const card=document.getElementById('awsRuntimeCard');
+        const title=document.getElementById('awsRuntimeTitle');
+        const text=document.getElementById('awsRuntimeText');
+        const install=document.getElementById('installAwsRuntime');
+        card.classList.toggle('is-ready',!!data.awsInstalled);card.classList.toggle('is-missing',!data.awsInstalled);
+        title.textContent=data.awsInstalled?'AWS CLI v2 готов':'Требуется AWS CLI v2';
+        const python=data.pythonInstalled?'Python обнаружен: '+(data.pythonVersion||data.pythonPath):'Отдельный Python не установлен и для AWS CLI v2 не требуется.';
+        text.textContent=(data.awsInstalled?(data.awsVersion||data.awsPath):data.message)+' '+python;
+        install.hidden=!!data.awsInstalled;
+        return data;
+    }
+
+    async function installAwsCli(confirmed){
+        if(!confirmed&&!await appConfirm('Скачать официальный AWSCLIV2-User.msi с awscli.amazonaws.com и установить AWS CLI v2 для текущего пользователя?',{title:'Установка AWS CLI v2',confirmText:'Скачать и установить'}))return false;
+        const button=document.getElementById('installAwsRuntime');const old=button.textContent;
+        try{button.disabled=true;button.textContent='Скачивание и установка…';const data=await apiJson('/api/runtime/install-aws',{method:'POST'});await loadRuntimeStatus();await showAppDialog({title:'AWS CLI v2 установлен',message:(data.awsVersion||'Компонент готов')+'\nТеперь можно проверять S3-профили.',kind:'info'});return true;}
+        catch(e){await showAppDialog({title:'Ошибка установки AWS CLI',message:e.message,kind:'error'});return false;}
+        finally{button.disabled=false;button.textContent=old;}
     }
 
     async function loadS3Profiles(){
@@ -4640,30 +5035,42 @@ html[data-theme="light"] #recentEventTooltip{
         (data.profiles||[]).forEach(function(profile){
             const row=document.createElement('div');row.className='manager-row';
             const main=document.createElement('div');main.className='manager-row-main';
-            const strong=document.createElement('strong');strong.textContent=profile.name;
+            const strong=document.createElement('strong');strong.textContent=profile.displayName||profile.name;
             const meta=document.createElement('span');meta.textContent=(profile.accessKey||'Ключ не задан')+(profile.endpoint?' · '+profile.endpoint:'');
             main.append(strong,meta);row.appendChild(main);
             const reveal=document.createElement('button');reveal.type='button';reveal.textContent='Показать';
             reveal.addEventListener('click',async function(){
                 try{const full=await apiJson('/api/s3-profiles/reveal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name})});
-                    document.getElementById('s3ProfileName').value=full.name||'';document.getElementById('s3AccessKey').value=full.accessKey||'';document.getElementById('s3SecretKey').value=full.secretKey||'';document.getElementById('s3SessionToken').value=full.sessionToken||'';document.getElementById('s3Region').value=full.region||'';document.getElementById('s3Endpoint').value=full.endpoint||'';
+                    document.getElementById('s3ProfileName').value=full.name||'';document.getElementById('s3DisplayName').value=full.displayName||full.name||'';document.getElementById('s3AccessKey').value=full.accessKey||'';document.getElementById('s3SecretKey').value=full.secretKey||'';document.getElementById('s3SessionToken').value=full.sessionToken||'';document.getElementById('s3Region').value=full.region||'';document.getElementById('s3Endpoint').value=full.endpoint||'';
                 }catch(e){profilesError.textContent=e.message;}
             });row.appendChild(reveal);
-            const test=document.createElement('button');test.type='button';test.textContent='Проверить';test.addEventListener('click',async function(){try{test.disabled=true;test.textContent='Проверяю…';const r=await apiJson('/api/s3-profiles/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name,Endpoint:profile.endpoint||''})});await showAppDialog({title:'S3-подключение',message:r.message||'Подключение успешно',kind:'info'});}catch(e){await showAppDialog({title:'Ошибка S3',message:e.message,kind:'error'});}finally{test.disabled=false;test.textContent='Проверить';}});row.appendChild(test);
+            const test=document.createElement('button');test.type='button';test.textContent='Проверить';test.addEventListener('click',async function(){try{test.disabled=true;test.textContent='Проверяю…';let runtime=await loadRuntimeStatus();if(!runtime.awsInstalled){if(!await installAwsCli())return;runtime=await loadRuntimeStatus();if(!runtime.awsInstalled)throw new Error('AWS CLI v2 не обнаружен после установки. Перезапустите BS3 и повторите проверку.');}const r=await apiJson('/api/s3-profiles/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name,Endpoint:profile.endpoint||''})});await showAppDialog({title:'S3-подключение',message:r.message||'Подключение успешно',kind:'info'});}catch(e){await showAppDialog({title:'Ошибка S3',message:e.message,kind:'error'});}finally{test.disabled=false;test.textContent='Проверить';}});row.appendChild(test);
             const del=document.createElement('button');del.type='button';del.textContent='Удалить';del.className='danger';del.addEventListener('click',async function(){if(!await appConfirm('Удалить S3-профиль «'+profile.name+'» из AWS CLI?',{title:'Удаление S3-профиля',confirmText:'Удалить',kind:'danger'}))return;try{await apiJson('/api/s3-profiles/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name})});await loadS3Profiles();clearS3Form();}catch(e){profilesError.textContent=e.message;}});row.appendChild(del);
             list.appendChild(row);
         });
         if(!(data.profiles||[]).length)list.innerHTML='<div class="favorites-empty">S3-профили AWS CLI не найдены.</div>';
     }
 
-    profilesButton.addEventListener('click',async function(){profilesError.textContent='';profilesModal.hidden=false;document.body.classList.add('modal-open');try{await Promise.all([loadConfigProfiles(),loadS3Profiles()]);}catch(e){profilesError.textContent=e.message;}});
+    profilesButton.addEventListener('click',async function(){profilesError.textContent='';profilesModal.hidden=false;document.body.classList.add('modal-open');try{await Promise.all([loadConfigProfiles(),loadS3Profiles(),loadRuntimeStatus()]);}catch(e){profilesError.textContent=e.message;}});
     function closeProfiles(){profilesModal.hidden=true;document.body.classList.remove('modal-open');profilesError.textContent='';}
     document.getElementById('closeProfilesModal').addEventListener('click',closeProfiles);
     document.getElementById('saveConfigProfile').addEventListener('click',async function(){try{const name=document.getElementById('configProfileName').value.trim();await apiJson('/api/config-profiles/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:name})});await loadConfigProfiles();}catch(e){profilesError.textContent=e.message;}});
     document.getElementById('importConfigProfile').addEventListener('change',async function(){const file=this.files&&this.files[0];if(!file)return;try{const profile=JSON.parse(await file.text());if(profile.format!=='BackupS3Manager.Profile'||!Array.isArray(profile.jobs))throw new Error('Файл не является профилем BackupS3 Manager.');const names=profile.jobs.map(x=>String(x&&x.Name||'').trim()).filter(Boolean);if(new Set(names.map(x=>x.toLowerCase())).size!==names.length)throw new Error('В профиле есть базы с повторяющимися именами.');const name=String(profile.name||file.name.replace(/\.json$/i,'')).trim();if(!await appConfirm('Профиль «'+name+'» содержит баз: '+names.length+'. Проверка структуры пройдена. Импортировать?',{title:'Проверка профиля',confirmText:'Импортировать'}))return;document.getElementById('configProfileName').value=name;await apiJson('/api/config-profiles/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:name,Profile:profile})});await loadConfigProfiles();await showAppDialog({title:'Профиль импортирован',message:'Профиль «'+name+'» добавлен в список. Баз: '+names.length+'.',kind:'info'});}catch(e){profilesError.textContent='Ошибка импорта: '+e.message;}finally{this.value='';}});
     document.getElementById('clearS3ProfileForm').addEventListener('click',clearS3Form);
+    document.getElementById('checkAwsRuntime').addEventListener('click',async function(){try{this.disabled=true;await loadRuntimeStatus();}catch(e){profilesError.textContent=e.message;}finally{this.disabled=false;}});
+    document.getElementById('installAwsRuntime').addEventListener('click',function(){installAwsCli(false);});
     document.querySelectorAll('.toggle-secret').forEach(function(button){button.addEventListener('click',function(){const input=document.getElementById(button.dataset.target);const show=input.type==='password';input.type=show?'text':'password';button.textContent=show?'Скрыть':'Показать';});});
-    document.getElementById('s3ProfileForm').addEventListener('submit',async function(event){event.preventDefault();profilesError.textContent='';try{await apiJson('/api/s3-profiles/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:document.getElementById('s3ProfileName').value.trim(),AccessKey:document.getElementById('s3AccessKey').value.trim(),SecretKey:document.getElementById('s3SecretKey').value.trim(),SessionToken:document.getElementById('s3SessionToken').value.trim(),Region:document.getElementById('s3Region').value.trim(),Endpoint:document.getElementById('s3Endpoint').value.trim()})});clearS3Form();await loadS3Profiles();await showAppDialog({title:'S3-профиль сохранён',message:'Учётные данные записаны в стандартное хранилище AWS CLI.',kind:'info'});}catch(e){profilesError.textContent=e.message;}});
+    document.getElementById('s3ProfileForm').addEventListener('submit',async function(event){
+        event.preventDefault();profilesError.textContent='';
+        try{
+            const savedName=document.getElementById('s3ProfileName').value.trim();
+            const displayName=document.getElementById('s3DisplayName').value.trim();
+            await apiJson('/api/s3-profiles/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:savedName,DisplayName:displayName,AccessKey:document.getElementById('s3AccessKey').value.trim(),SecretKey:document.getElementById('s3SecretKey').value.trim(),SessionToken:document.getElementById('s3SessionToken').value.trim(),Region:document.getElementById('s3Region').value.trim(),Endpoint:document.getElementById('s3Endpoint').value.trim()})});
+            clearS3Form();await loadS3Profiles();const runtime=await loadRuntimeStatus();
+            if(runtime.awsInstalled){await showAppDialog({title:'S3-профиль сохранён',message:'Подключение «'+(displayName||savedName)+'» обнаружено и записано в стандартное хранилище AWS CLI. Можно выполнить проверку.',kind:'info'});}
+            else if(await appConfirm('Подключение «'+(displayName||savedName)+'» сохранено и видно BackupS3.\n\nAWS CLI v2 не установлен, поэтому проверка и загрузка S3 пока недоступны. Установить официальный AWS CLI v2 сейчас?\n\nОтдельный Python для AWS CLI v2 не требуется.',{title:'Требуется AWS CLI v2',confirmText:'Установить'})){await installAwsCli(true);}
+        }catch(e){profilesError.textContent=e.message;}
+    });
 
     // v17: runtime settings.
     const settingsButton=document.getElementById('settingsButton');
@@ -4682,10 +5089,57 @@ html[data-theme="light"] #recentEventTooltip{
     const settingAutoScheduler=document.getElementById('settingAutoScheduler');
     const settingAutoSchedulerInterval=document.getElementById('settingAutoSchedulerInterval');
     const settingAutoStartBackground=document.getElementById('settingAutoStartBackground');
+    const databaseViewOptions=document.getElementById('databaseViewOptions');
     const settingUpdateManifestUrl=document.getElementById('settingUpdateManifestUrl');
     const checkUpdatesButton=document.getElementById('checkUpdatesButton');
     const downloadUpdateButton=document.getElementById('downloadUpdateButton');
+    const installUpdateButton=document.getElementById('installUpdateButton');
     const updateCheckStatus=document.getElementById('updateCheckStatus');
+
+    function selectedDatabaseView(){return databaseViewOptions.querySelector('input:checked')?.value||'compact'}
+    function configureViewColumns(table,mode){
+        [...table.rows].filter(row=>!row.classList.contains('server-group-row')).forEach(row=>{
+            [...row.cells].forEach((cell,index)=>{if(cell.dataset.originalColumn==null)cell.dataset.originalColumn=String(index);cell.style.display=''});
+            [...row.cells].sort((a,b)=>Number(a.dataset.originalColumn)-Number(b.dataset.originalColumn)).forEach(cell=>row.appendChild(cell));
+        });
+    }
+    function applyDatabaseView(mode){
+        if(!['compact','grouped','tree'].includes(mode))mode='compact';
+        const table=document.getElementById('jobs'),tbody=table?.tBodies[0];if(!tbody)return;
+        const serverCards=document.getElementById('serverCards');serverCards.innerHTML='';
+        tbody.querySelectorAll('.server-group-row').forEach(row=>row.remove());
+        const rows=[...tbody.querySelectorAll('tr.db-row')];
+        rows.forEach((row,index)=>{if(!row.dataset.viewIndex)row.dataset.viewIndex=String(index);row.classList.remove('view-collapsed')});
+        table.dataset.viewMode=mode;configureViewColumns(table,mode);
+        const descriptions={compact:'Сервер и состояние агента видны прямо в каждой строке базы.',grouped:'Базы сгруппированы по серверу; карточка показывает подключение, версию и последнюю связь.',tree:'Серверы сворачиваются, а базы раскрываются внутри выбранного агента.'};
+        document.getElementById('databaseViewDescription').textContent=descriptions[mode];document.querySelectorAll('#databaseViewToolbar [data-view]').forEach(button=>button.classList.toggle('active',button.dataset.view===mode));
+        if(mode==='compact'){rows.sort((a,b)=>Number(a.dataset.viewIndex)-Number(b.dataset.viewIndex)).forEach(row=>tbody.appendChild(row));return}
+        const groups=new Map();
+        rows.forEach(row=>{const cell=row.querySelector('.agent-cell');const host=(cell?.querySelector('.muted')?.textContent||'Host: локальный').replace(/^Host:\s*/i,'').trim()||'Локальный';const name=cell?.querySelector('.agent-name')?.textContent.trim()||host;const online=cell?.querySelector('.agent-state')?.classList.contains('online')||false;const muted=[...cell?.querySelectorAll('.muted')||[]].map(x=>x.textContent.trim());const agentId=row.dataset.agentId||'';const info=registeredAgentGroups.find(agent=>agent.id===agentId)||{};row.dataset.serverKey=host;if(!groups.has(host))groups.set(host,{host,name,online,agentId,ip:info.ip||'',version:muted[1]||'Agent —',rows:[]});groups.get(host).rows.push(row)});
+        registeredAgentGroups.forEach(agent=>{const host=String(agent.host||agent.displayName||'Ожидает подключения');if(!groups.has(host))groups.set(host,{host:host,name:agent.displayName||host,online:!!agent.online,agentId:agent.id||'',ip:agent.ip||'',version:agent.version||'Agent —',rows:[]})});
+        const collapsed=JSON.parse(localStorage.getItem('backupS3CollapsedServers')||'{}');
+        groups.forEach(group=>{const card=document.createElement('div');card.className='server-group-row';card.dataset.server=group.host;card.dataset.agentId=group.agentId;card.dataset.online=group.online?'1':'0';const isCollapsed=mode==='tree'&&!!collapsed[group.host];const toggle=mode==='tree'?'<button type="button" class="server-group-toggle" aria-label="Свернуть или раскрыть">'+(isCollapsed?'›':'⌄')+'</button>':'<span></span>';const ip=group.ip?'<span class="server-agent-ip">IP: '+escapeAgentText(group.ip)+'</span>':'<span>IP: локальный компьютер</span>';card.innerHTML='<div class="server-group-card">'+toggle+'<div class="server-group-main"><div class="server-group-title">'+escapeAgentText(group.name)+'</div><div class="server-group-meta"><span>Host: '+escapeAgentText(group.host)+'</span>'+ip+'<span>'+escapeAgentText(group.version)+'</span></div></div><div class="server-group-stat"><span>Связь</span><strong>'+(group.online?'Сейчас':'Нет связи')+'</strong></div><div class="server-group-stat"><span>Базы</span><strong>'+group.rows.length+'</strong></div><div class="server-group-stat"><span>Состояние</span><strong>'+(group.online?'Агент подключён':'Проверить агент')+'</strong></div><div class="server-group-actions"><button type="button" class="server-group-action">↻ Проверить базы</button></div></div>';serverCards.appendChild(card);group.rows.forEach(row=>{row.classList.toggle('view-collapsed',isCollapsed);tbody.appendChild(row)})});
+    }
+    document.getElementById('serverCards')?.addEventListener('click',event=>{const button=event.target.closest('.server-group-toggle');if(!button)return;const header=button.closest('.server-group-row'),host=header.dataset.server;const collapsed=JSON.parse(localStorage.getItem('backupS3CollapsedServers')||'{}');collapsed[host]=!collapsed[host];localStorage.setItem('backupS3CollapsedServers',JSON.stringify(collapsed));applyDatabaseView('tree')});
+    document.getElementById('serverCards')?.addEventListener('click',async event=>{
+        const action=event.target.closest('.server-group-action');if(!action)return;
+        event.stopPropagation();
+        const header=action.closest('.server-group-row');const host=header.dataset.server;const buttons=[...document.querySelectorAll('#jobs tr.db-row')].filter(row=>row.dataset.serverKey===host).map(row=>row.querySelector('.check-job')).filter(Boolean);
+        if(!buttons.length){await appAlert('На этом сервере пока нет назначенных баз.',{title:'Проверка сервера'});return}
+        action.disabled=true;const oldText=action.textContent;action.textContent='Запускаю…';
+        try{
+            const agentId=buttons[0].dataset.agentId||'';const names=buttons.map(button=>button.dataset.job);
+            if(agentId){
+                for(const name of names){const response=await fetch('/api/agents/request-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:agentId,name:name})});if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||'Агент не принял команду.')}
+                await appAlert('Команда отправлена агенту. Назначенных баз: '+names.length+'. Результаты появятся после ближайшего heartbeat.',{title:'Проверка сервера запущена'});setTimeout(()=>location.reload(),17000);
+            }else{
+                const response=await fetch('/api/jobs/check-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Names:names})});if(!response.ok)throw new Error(await response.text());
+                await appAlert('Локальная проверка запущена. Баз: '+names.length+'.',{title:'Проверка Manager запущена'});setTimeout(()=>location.reload(),1800);
+            }
+        }catch(error){await appAlert(error.message,{title:'Ошибка проверки',kind:'error'});action.disabled=false;action.textContent=oldText}
+    });
+    databaseViewOptions.addEventListener('change',async event=>{if(!event.target.matches('input[name="databaseViewMode"]'))return;const mode=event.target.value;applyDatabaseView(mode);localStorage.setItem('backupS3DatabaseView',mode);await fetch('/api/ui-settings/global',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({DatabaseViewMode:mode})}).catch(()=>{})});
+    document.getElementById('databaseViewToolbar').addEventListener('click',async event=>{const button=event.target.closest('[data-view]');if(!button)return;const mode=button.dataset.view;const radio=databaseViewOptions.querySelector('input[value="'+mode+'"]');if(radio)radio.checked=true;applyDatabaseView(mode);localStorage.setItem('backupS3DatabaseView',mode);await fetch('/api/ui-settings/global',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({DatabaseViewMode:mode})}).catch(()=>{})});
 
     function updateSettingsDangerState(){
         const safe=settingSafeMode.checked;
@@ -4733,9 +5187,10 @@ html[data-theme="light"] #recentEventTooltip{
         settingAutoSchedulerInterval.disabled=!settingAutoScheduler.checked;
         settingAutoStartBackground.checked=!!s.AutoStartInBackground;
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
+        try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'23.16');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v23.16';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.4');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.4';});
 
         updateSettingsDangerState();
         return s;
@@ -4776,6 +5231,18 @@ html[data-theme="light"] #recentEventTooltip{
         }catch(e){updateCheckStatus.classList.remove('update-current','update-available');updateCheckStatus.textContent='Ошибка: '+e.message;}
         finally{this.disabled=false;this.textContent=old;}
     });
+    async function installDownloadedUpdate(){
+        installUpdateButton.disabled=true;installUpdateButton.textContent='Запускаю установку…';
+        try{
+            const ir=await fetch('/api/update/install',{method:'POST'});const install=await ir.json();
+            if(!ir.ok)throw new Error(install.error||'Не удалось запустить установщик');
+            updateCheckStatus.textContent='BS3 закрывается. После установки приложение запустится снова…';
+        }catch(e){installUpdateButton.disabled=false;installUpdateButton.textContent='Установить обновление';throw e;}
+    }
+    installUpdateButton.addEventListener('click',async function(){
+        if(!await appConfirm('Закрыть BS3, установить скачанное обновление и запустить приложение снова?',{title:'Установка обновления',confirmText:'Установить'}))return;
+        try{await installDownloadedUpdate();}catch(e){await showAppDialog({title:'Ошибка установки',message:e.message,kind:'error'});}
+    });
     downloadUpdateButton.addEventListener('click',async function(){
         const old=this.textContent;this.disabled=true;this.textContent='Скачивается…';
         try{
@@ -4787,8 +5254,8 @@ html[data-theme="light"] #recentEventTooltip{
             const details=document.getElementById('updateProgressDetails');
             const title=document.getElementById('updateProgressTitle');
             const formatBytes=n=>{n=Number(n)||0;if(n>=1073741824)return (n/1073741824).toFixed(2)+' ГБ';if(n>=1048576)return (n/1048576).toFixed(1)+' МБ';if(n>=1024)return (n/1024).toFixed(1)+' КБ';return n+' Б';};
-            panel.hidden=false;fill.style.width='0%';percentText.textContent='0%';title.textContent='Скачивание BackupS3 v'+(data.version||'');
-            await new Promise((resolve,reject)=>{
+            panel.hidden=false;installUpdateButton.hidden=true;fill.style.width='0%';percentText.textContent='0%';title.textContent='Скачивание BackupS3 v'+(data.version||'');
+            const completed=await new Promise((resolve,reject)=>{
                 const poll=async()=>{
                     try{
                         const pr=await fetch('/api/update/progress?t='+Date.now(),{cache:'no-store'});const p=await pr.json();
@@ -4802,7 +5269,13 @@ html[data-theme="light"] #recentEventTooltip{
                     }catch(e){reject(e);}
                 };poll();
             });
-            await showAppDialog({title:'Обновление загружено',message:'Файл сохранён в папку «Загрузки». Можно закрыть BackupS3 и запустить установщик.',kind:'info'});
+            installUpdateButton.hidden=false;installUpdateButton.disabled=false;installUpdateButton.textContent='Установить обновление';
+            const installNow=await appConfirm('Обновление скачано:\n'+completed.path+'\n\nЗакрыть BS3, установить обновление и запустить приложение снова?',{title:'Обновление готово',confirmText:'Установить'});
+            if(installNow){
+                await installDownloadedUpdate();
+            }else{
+                await showAppDialog({title:'Установите позже',message:'MSI сохранён. Для завершения обновления закройте BS3 и запустите этот файл:\n'+completed.path,kind:'info'});
+            }
         }catch(e){await showAppDialog({title:'Ошибка обновления',message:e.message,kind:'error'});}
         finally{this.disabled=false;this.textContent=old;}
     });
@@ -5397,14 +5870,21 @@ html[data-theme="light"] #recentEventTooltip{
                             const remaining=Number(st.remainingBytes||Math.max(0,Number(st.sizeBytes||0)-uploaded));
                             const speed=st.speedText||'';
 
-                            upload.textContent=
-                                (st.percent||0)+'% · '+
-                                fmtBytesClient(uploaded)+' / '+fmtBytesClient(Number(st.sizeBytes||0));
-
-                            state.textContent=
-                                'Загружено '+fmtBytesClient(uploaded)+
-                                ' · осталось '+fmtBytesClient(remaining)+
-                                (speed?' · '+speed:'');
+                            if(st.status==='QUEUED'){
+                                upload.textContent='В очереди';
+                                state.textContent=st.message||'Команда передана агенту';
+                            }else if(st.status==='STARTING'){
+                                upload.textContent='Агент запускает…';
+                                state.textContent=st.message||'Запуск загрузки на сервере агента';
+                            }else{
+                                upload.textContent=
+                                    (st.percent||0)+'% · '+
+                                    fmtBytesClient(uploaded)+' / '+fmtBytesClient(Number(st.sizeBytes||0));
+                                state.textContent=
+                                    'Загружено '+fmtBytesClient(uploaded)+
+                                    ' · осталось '+fmtBytesClient(remaining)+
+                                    (speed?' · '+speed:'');
+                            }
 
                             if(st.status==='FINISHED'){
                                 clearInterval(timer);
@@ -5415,6 +5895,7 @@ html[data-theme="light"] #recentEventTooltip{
                                 setTimeout(async()=>{
                                     await refreshEditLocal(databaseName);
                                     await refreshEditS3(databaseName);
+                                    setTimeout(()=>window.location.reload(),1200);
                                 },700);
                             }
                             else if(st.status==='ERROR'){
@@ -5762,6 +6243,9 @@ html[data-theme="light"] #recentEventTooltip{
         document.getElementById('editJobTitle').textContent=d.Name;
         document.getElementById('editJobName').value=d.Name;
         document.getElementById('editLocalPath').value=d.LocalPath||'';
+        const agentSelect=document.getElementById('editAgentId');agentSelect.innerHTML='<option value="">Этот компьютер (Manager)</option>';
+        try{const ar=await fetch('/api/agents?t='+Date.now(),{cache:'no-store'});if(ar.ok){const ad=await ar.json();(ad.agents||[]).forEach(agent=>{if(!agent.host)return;const option=document.createElement('option');option.value=agent.id;option.textContent=(agent.displayName||agent.host)+' · '+agent.host+(agent.online?' · подключён':' · нет связи');agentSelect.appendChild(option)})}}catch(_){}
+        agentSelect.value=d.AgentId||'';
         document.getElementById('editBucket').value=d.Bucket||'pw1';
         document.getElementById('editS3Path').value=d.S3Path||'';
         document.getElementById('editFilePrefix').value=d.FilePrefix||'';
@@ -5858,6 +6342,7 @@ html[data-theme="light"] #recentEventTooltip{
         const payload={
             Name:document.getElementById('editJobName').value,
             LocalPath:document.getElementById('editLocalPath').value.trim(),
+            AgentId:document.getElementById('editAgentId').value,
             Bucket:document.getElementById('editBucket').value,
             S3Path:document.getElementById('editS3Path').value.trim(),
             FilePrefix:document.getElementById('editFilePrefix').value.trim(),
@@ -5978,6 +6463,13 @@ html[data-theme="light"] #recentEventTooltip{
             button.textContent = '...';
 
             try {
+                const agentId=button.dataset.agentId||'';
+                if(agentId){
+                    const remote=await fetch('/api/agents/request-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:agentId,name:name})});
+                    const remoteResult=await remote.json().catch(()=>({}));if(!remote.ok)throw new Error(remoteResult.error||'Агент не принял команду проверки.');
+                    await appAlert('Команда отправлена агенту. Проверка локальной папки пройдёт на назначенном сервере, результат появится после ближайшего heartbeat.',{title:'Удалённая проверка запущена'});
+                    setTimeout(()=>location.reload(),17000);return;
+                }
                 const response = await fetch('/api/jobs/check', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },

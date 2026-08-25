@@ -18,3 +18,6 @@ Logs/
 README-v*.md
 BackendTemplate/README-*.txt
 Import-LegacyData.ps1
+# .NET build outputs
+agent/bin/
+agent/obj/

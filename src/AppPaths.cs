@@ -36,6 +36,7 @@ internal static class AppPaths
     public static string HistoryPath => Path.Combine(StateDir, "history.jsonl");
     public static string ControllerStatePath => Path.Combine(StateDir, "controller.json");
     public static string SchedulerStatePath => Path.Combine(StateDir, "scheduler-state.json");
+    public static string AgentStatePath => Path.Combine(StateDir, "agents.json");
     public static string CancelFlagPath => Path.Combine(StateDir, "cancel.flag");
     public static string ManualUploadsDir => Path.Combine(StateDir, "ManualUploads");
     public static string UploadProgressDir => Path.Combine(StateDir, "UploadProgress");

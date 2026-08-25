@@ -6,6 +6,15 @@ namespace BackupS3Manager;
 
 public sealed class MainForm : Form
 {
+    private const int DwmUseImmersiveDarkMode = 20;
+    private const int DwmUseImmersiveDarkModeBefore20H1 = 19;
+    private const int DwmBorderColor = 34;
+    private const int DwmCaptionColor = 35;
+    private const int DwmTextColor = 36;
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
+
     private readonly WebView2 _web = new() { Dock = DockStyle.Fill };
     private readonly ToolStripButton _reloadButton = new("Обновить Dashboard") { Enabled = false };
     private readonly ToolStrip _toolsStrip;
@@ -25,14 +34,17 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _trayStorage = new("Копии: —") { Enabled = false };
     private readonly ToolStripMenuItem _trayMode = new("Режим: —") { Enabled = false };
     private readonly ContextMenuStrip _trayMenu = new();
+    private readonly AgentHubServer _agentHub = new();
 
     internal MainForm(SplashForm? splash = null, bool startInBackground = false)
     {
         _splash = splash;
         _startBackground = startInBackground;
         _schedulerTimer.Tick += async (_, _) => await RunDueSchedulerAsync();
+        try { _agentHub.Start(); } catch (Exception ex) { AppLog.Warn("Не удалось запустить Agent Hub: " + ex.Message); }
         Text = "Backup S3 Manager";
         Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+        BackColor = Color.FromArgb(11, 15, 21);
         Width = 1550;
         Height = 940;
         StartPosition = FormStartPosition.CenterScreen;
@@ -170,8 +182,38 @@ public sealed class MainForm : Form
                 HideToTray(showNotice: true);
             }
         };
-        FormClosed += (_,_) => { _schedulerTimer.Dispose(); _trayIcon.Visible = false; _trayIcon.Dispose(); _trayMenu.Dispose(); };
+        FormClosed += (_,_) => { _agentHub.Dispose(); _schedulerTimer.Dispose(); _trayIcon.Visible = false; _trayIcon.Dispose(); _trayMenu.Dispose(); };
     }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyBackupS3WindowChrome();
+    }
+
+    private void ApplyBackupS3WindowChrome()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var enabled = 1;
+            if (DwmSetWindowAttribute(Handle, DwmUseImmersiveDarkMode, ref enabled, sizeof(int)) != 0)
+                DwmSetWindowAttribute(Handle, DwmUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
+
+            var caption = ToColorRef(Color.FromArgb(16, 21, 29));
+            var border = ToColorRef(Color.FromArgb(43, 55, 70));
+            var text = ToColorRef(Color.FromArgb(225, 235, 247));
+            DwmSetWindowAttribute(Handle, DwmCaptionColor, ref caption, sizeof(int));
+            DwmSetWindowAttribute(Handle, DwmBorderColor, ref border, sizeof(int));
+            DwmSetWindowAttribute(Handle, DwmTextColor, ref text, sizeof(int));
+        }
+        catch
+        {
+            // На старых версиях Windows остаётся штатная рабочая строка окна.
+        }
+    }
+
+    private static int ToColorRef(Color color) => color.R | (color.G << 8) | (color.B << 16);
 
     private static Bitmap CreateTrayGlyph(Color color, string text)
     {
@@ -296,7 +338,7 @@ public sealed class MainForm : Form
         var env = await CoreWebView2Environment.CreateAsync(browserExecutableFolder, userData);
         await _web.EnsureCoreWebView2Async(env);
 
-        _bridge = new ApiBridge(BrowseFolderAsync);
+        _bridge = new ApiBridge(BrowseFolderAsync, RequestExitForUpdate);
         _schedulerTimer.Start();
 
         _web.CoreWebView2.Settings.AreDevToolsEnabled = false;
@@ -396,7 +438,7 @@ public sealed class MainForm : Form
     private void NavigateHome()
     {
         AppPaths.GenerateDashboard();
-        _web.Source = new Uri("https://app.local/index.html");
+        _web.Source = new Uri($"https://app.local/index.html?t={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
     }
 
     private const string ApiFetchShim = """
@@ -570,6 +612,16 @@ public sealed class MainForm : Form
                 catch { }
             }
         }
+    }
+
+    private void RequestExitForUpdate()
+    {
+        if (IsDisposed) return;
+        BeginInvoke(() =>
+        {
+            _allowExit = true;
+            Close();
+        });
     }
 
     private Task<string?> BrowseFolderAsync(string? initial)

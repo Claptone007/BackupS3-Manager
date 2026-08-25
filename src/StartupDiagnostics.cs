@@ -30,7 +30,7 @@ internal sealed class DiagnosticReport
     public string ToPlainText()
     {
         var sb = new StringBuilder();
-        sb.AppendLine("Backup S3 Manager v23.16 — диагностика");
+        sb.AppendLine("Backup S3 Manager v24.4 — диагностика");
         sb.AppendLine($"Время: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
         sb.AppendLine($"Computer: {Environment.MachineName}");
         sb.AppendLine($"User: {Environment.UserDomainName}\\{Environment.UserName}");
@@ -365,6 +365,16 @@ internal static class StartupDiagnostics
                     if (File.Exists(candidate)) return candidate;
                 }
                 catch { }
+            }
+            if (exe.Equals("aws", StringComparison.OrdinalIgnoreCase) || exe.Equals("aws.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var candidate in new[]
+                {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Amazon", "AWSCLIV2", "aws.exe"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Amazon", "AWSCLIV2", "aws.exe"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Amazon", "AWSCLIV2", "aws.exe")
+                })
+                    if (File.Exists(candidate)) return candidate;
             }
         }
         catch { }
