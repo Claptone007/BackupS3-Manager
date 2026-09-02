@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][string]$RootPath,
     [Parameter(Mandatory=$true)][string]$Database,
     [Parameter(Mandatory=$true)][string]$FilePath,
@@ -7,6 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:AWS_PAGER = ""
+# Повторять отдельные S3-запросы и части multipart-upload при временных
+# сетевых ошибках. Это не запускает повторную передачу всего файла с нуля.
+$env:AWS_RETRY_MODE = "standard"
+$env:AWS_MAX_ATTEMPTS = "10"
 
 $root = [System.IO.Path]::GetFullPath($RootPath)
 $configFile = Join-Path $root "BackupJobs.psd1"
@@ -131,6 +135,26 @@ function Get-AwsTransferProgressFromText {
         UploadedBytes=[Int64][Math]::Min($ExpectedTotalBytes,$uploaded)
         SpeedText=[string]$x.Groups[5].Value
     }
+}
+
+function Get-AwsFailureSummary {
+    param([string]$Text)
+    if([string]::IsNullOrWhiteSpace($Text)){return "AWS CLI завершился без текста ошибки."}
+
+    # AWS печатает прогресс через перевод каретки. После перенаправления это
+    # превращается в одну гигантскую строку и скрывает настоящее сообщение.
+    $clean=[regex]::Replace(
+        $Text,
+        'Completed\s+[0-9]+(?:[\.,][0-9]+)?\s*(?:Bytes|B|KiB|MiB|GiB|TiB)\s*/\s*[0-9]+(?:[\.,][0-9]+)?\s*(?:Bytes|B|KiB|MiB|GiB|TiB)\s*\([^)]*\)\s*with\s+\d+\s+file\(s\)\s+remaining\s*',
+        '',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    $clean=($clean -replace '[\r\n\t]+',' ' -replace '\s{2,}',' ').Trim()
+    if([string]::IsNullOrWhiteSpace($clean)){
+        return "AWS CLI прервал передачу без отдельного сообщения. Проверьте сеть и журнал операции."
+    }
+    if($clean.Length -gt 4000){$clean=$clean.Substring($clean.Length-4000)}
+    return $clean
 }
 
 function Invoke-AwsNative {
@@ -396,13 +420,22 @@ try{
         }
     }
 
-    Write-Status "UPLOADING" 10 "Загрузка на $dest" $key
+    Write-Status `
+        -Status "UPLOADING" `
+        -Percent 0 `
+        -Message "Подготовка загрузки на $dest" `
+        -S3Key $key `
+        -UploadedBytes 0 `
+        -RemainingBytes ([Int64]$item.Length)
     $sw=[Diagnostics.Stopwatch]::StartNew()
 
     $cpArgs=$aws+@("s3","cp",$item.FullName,$dest)
-    Write-UploadLog "Starting stable synchronous aws s3 cp (progress bar disabled)"
+    Write-UploadLog "Starting aws s3 cp with byte-level progress tracking"
     Write-UploadLog ("CP arguments: "+(($cpArgs|ForEach-Object{"["+[string]$_+"]"}) -join " "))
-    $cpResult=Invoke-AwsNative -Arguments $cpArgs
+    $cpResult=Invoke-AwsUploadWithProgress `
+        -BaseArguments $cpArgs `
+        -TotalBytes ([Int64]$item.Length) `
+        -S3Key $key
 
     if($null -eq $cpResult){
         throw "AWS CLI не вернул результат выполнения."
@@ -411,12 +444,13 @@ try{
     $exit=[int]$cpResult.ExitCode
 
     $sw.Stop()
-    Write-UploadLog "aws s3 cp exit=$exit output=$($cpResult.Output)"
     if($exit -ne 0){
-        $detail=$cpResult.Output
-        if([string]::IsNullOrWhiteSpace($detail)){$detail="AWS CLI завершился с кодом $exit без текста ошибки."}
+        $cpSummary=Get-AwsFailureSummary ([string]$cpResult.Output)
+        Write-UploadLog "aws s3 cp exit=$exit summary=$cpSummary"
+        $detail=$cpSummary
         throw "AWS upload failed (exit $exit): $detail"
     }
+    Write-UploadLog "aws s3 cp exit=0"
 
     Write-Status "VERIFYING" 90 "Проверяю объект после загрузки" $key
 

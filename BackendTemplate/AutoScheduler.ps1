@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$RootPath = $PSScriptRoot,
     [int]$LookbackMinutes = 240
 )

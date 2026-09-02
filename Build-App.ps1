@@ -30,6 +30,12 @@ if($LASTEXITCODE-ne0){throw "dotnet restore failed"}
 
 if($LASTEXITCODE-ne0){throw "dotnet publish failed"}
 
+# В публичную сборку никогда не помещаем рабочую конфигурацию разработчика.
+# Новый пользователь начинает с пустого списка баз и безопасных настроек.
+$cleanConfig=Join-Path $here "installer\BackupJobs.clean.psd1"
+$publishedConfig=Join-Path $out "BackendTemplate\BackupJobs.psd1"
+Copy-Item -LiteralPath $cleanConfig -Destination $publishedConfig -Force
+
 $fixedRuntime=Join-Path $here "runtime\WebView2Runtime"
 if(Test-Path -LiteralPath $fixedRuntime -PathType Container){
     $runtimeOut=Join-Path $out "WebView2Runtime"

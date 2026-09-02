@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.4";
+    private const string CurrentVersion = "24.5";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1764,20 +1764,27 @@ internal sealed class ApiBridge
         var job = await EffectiveJobAsync(name);
         if (job is null) return ApiResponse.Json(404, new { error = "База не найдена." });
 
-        // Удалённый путь должен обрабатывать агент, у которого этот диск доступен.
+        var assignedAgentId = job["AgentId"]?.ToString() ?? "";
+        var localFileAvailable = File.Exists(file);
+
+        // Явно назначенная агенту база всегда выполняется агентом. Для базы без
+        // назначения локальный файл имеет приоритет: совпадение имени базы в
+        // отчёте агента не должно случайно отправлять локальную загрузку на сервер.
         lock (AgentHubServer.StateLock)
         {
             var agentState = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
             var agents = agentState["agents"]?.AsArray().OfType<JsonObject>().ToArray() ?? Array.Empty<JsonObject>();
-            var assignedAgentId = job["AgentId"]?.ToString() ?? "";
             JsonObject? agent = assignedAgentId.Length > 0
                 ? agents.FirstOrDefault(item => item["id"]?.ToString() == assignedAgentId)
                 : null;
-            agent ??= agents
-                .Where(item => (item["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
-                    .Any(remote => string.Equals(remote["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase)))
-                .OrderByDescending(item => DateTimeOffset.TryParse(item["lastSeen"]?.ToString(), out var seen) ? seen : DateTimeOffset.MinValue)
-                .FirstOrDefault();
+            if (assignedAgentId.Length > 0 || !localFileAvailable)
+            {
+                agent ??= agents
+                    .Where(item => (item["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                        .Any(remote => string.Equals(remote["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase)))
+                    .OrderByDescending(item => DateTimeOffset.TryParse(item["lastSeen"]?.ToString(), out var seen) ? seen : DateTimeOffset.MinValue)
+                    .FirstOrDefault();
+            }
 
             var remoteJob = (agent?["report"]?["jobs"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
                 .FirstOrDefault(remote => string.Equals(remote["name"]?.ToString(), name, StringComparison.OrdinalIgnoreCase));
@@ -1800,7 +1807,13 @@ internal sealed class ApiBridge
                 WriteObjectAtomic(AppPaths.AgentStatePath, agentState);
                 return ApiResponse.Json(202, new { status = "queued", id = op, operationId = op, agent = agent["displayName"]?.ToString() ?? agent["host"]?.ToString() });
             }
+
+            if (assignedAgentId.Length > 0)
+                return ApiResponse.Json(409, new { error = "Назначенный агент не прислал сведения об этой базе. Обновите агента и повторите попытку." });
         }
+
+        if (!localFileAvailable)
+            return ApiResponse.Json(404, new { error = "Локальный файл недоступен Manager и не найден на подключённых агентах." });
 
         var initial = new JsonObject {
             ["id"] = op,
@@ -1808,6 +1821,9 @@ internal sealed class ApiBridge
             ["filePath"] = file,
             ["status"] = "STARTING",
             ["percent"] = 0,
+            ["sizeBytes"] = localFileAvailable ? new FileInfo(file).Length : 0,
+            ["uploadedBytes"] = 0,
+            ["remainingBytes"] = localFileAvailable ? new FileInfo(file).Length : 0,
             ["message"] = "Запуск Manual-Upload.ps1",
             ["startedAt"] = DateTimeOffset.Now.ToString("o")
         };

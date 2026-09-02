@@ -1,4 +1,4 @@
-$ErrorActionPreference="Continue"
+﻿$ErrorActionPreference="Continue"
 
 $taskName="BackupS3 Auto Scheduler"
 Write-Host "=== BackupS3 Stable Reset ===" -ForegroundColor Cyan

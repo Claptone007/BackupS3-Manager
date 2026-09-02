@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$RootPath = $PSScriptRoot,
     [int]$Port = 8765
 )

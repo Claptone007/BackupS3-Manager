@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot "BackupJobs.psd1"),
     [string]$JobName = "",
     [string]$JobNamesCsv = "",

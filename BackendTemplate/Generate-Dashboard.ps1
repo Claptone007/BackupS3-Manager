@@ -2302,6 +2302,24 @@ html[data-theme="light"] #recentEventTooltip{
     .db-upload-progress.error .db-upload-progress-percent{
         color:#ff8d96;
     }
+    .manual-upload-button.uploading{
+        --upload-percent:0%;
+        position:relative;
+        overflow:hidden;
+        isolation:isolate;
+        min-width:190px;
+        background:#12283a;
+        border-color:#3d8fc3;
+    }
+    .manual-upload-button.uploading::before{
+        content:"";
+        position:absolute;
+        z-index:-1;
+        inset:0 auto 0 0;
+        width:var(--upload-percent);
+        background:linear-gradient(90deg,#2476a8,#35b6cb);
+        transition:width .35s linear;
+    }
 
 </style>
 
@@ -5189,8 +5207,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.4');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.4';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.5');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.5';});
 
         updateSettingsDangerState();
         return s;
@@ -5855,7 +5873,12 @@ html[data-theme="light"] #recentEventTooltip{
                         throw new Error('Приложение не вернуло идентификатор операции загрузки');
                     }
 
-                    upload.textContent='0%';
+                    upload.classList.add('uploading');
+                    upload.style.setProperty('--upload-percent','0%');
+                    upload.setAttribute('aria-valuemin','0');
+                    upload.setAttribute('aria-valuemax','100');
+                    upload.setAttribute('aria-valuenow','0');
+                    upload.textContent='0% · 0 Б / '+fmtBytesClient(Number(file.SizeBytes||0));
 
                     const timer=setInterval(async()=>{
                         try{
@@ -5869,6 +5892,10 @@ html[data-theme="light"] #recentEventTooltip{
                             const uploaded=Number(st.uploadedBytes||0);
                             const remaining=Number(st.remainingBytes||Math.max(0,Number(st.sizeBytes||0)-uploaded));
                             const speed=st.speedText||'';
+                            const percent=Math.max(0,Math.min(100,Number(st.percent||0)));
+
+                            upload.style.setProperty('--upload-percent',percent+'%');
+                            upload.setAttribute('aria-valuenow',String(percent));
 
                             if(st.status==='QUEUED'){
                                 upload.textContent='В очереди';
@@ -5878,7 +5905,7 @@ html[data-theme="light"] #recentEventTooltip{
                                 state.textContent=st.message||'Запуск загрузки на сервере агента';
                             }else{
                                 upload.textContent=
-                                    (st.percent||0)+'% · '+
+                                    percent+'% · '+
                                     fmtBytesClient(uploaded)+' / '+fmtBytesClient(Number(st.sizeBytes||0));
                                 state.textContent=
                                     'Загружено '+fmtBytesClient(uploaded)+
@@ -5888,6 +5915,7 @@ html[data-theme="light"] #recentEventTooltip{
 
                             if(st.status==='FINISHED'){
                                 clearInterval(timer);
+                                upload.classList.remove('uploading');
                                 upload.textContent='Готово';
                                 state.textContent='На S3';
                                 state.className='local-s3-badge on-s3';
@@ -5900,6 +5928,7 @@ html[data-theme="light"] #recentEventTooltip{
                             }
                             else if(st.status==='ERROR'){
                                 clearInterval(timer);
+                                upload.classList.remove('uploading');
                                 upload.disabled=false;
                                 upload.textContent='Повторить';
                                 const detail=st.message||st.error||'Неизвестная ошибка';

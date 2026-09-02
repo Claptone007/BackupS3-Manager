@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$IntervalMinutes = 2
 )
 
