@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.5";
+    private const string CurrentVersion = "24.6";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1416,7 +1416,11 @@ internal sealed class ApiBridge
             if (remoteJob["available"]?.GetValue<bool>() != true)
                 return ApiResponse.Json(500, new { error = remoteJob["error"]?.ToString() ?? "Локальная папка недоступна агенту." });
 
-            var s3Remote = await ListS3ObjectsAsync(j);
+            var s3Remote = new List<JsonObject>();
+            var s3RemoteChecked = true;
+            var s3RemoteError = "";
+            try { s3Remote = await ListS3ObjectsAsync(j); }
+            catch (Exception ex) { s3RemoteChecked = false; s3RemoteError = ex.Message; }
             var remoteKeys = new HashSet<string>(s3Remote.Select(x => x["Key"]?.ToString() ?? ""), StringComparer.Ordinal);
             var remoteRoot = (j["S3Path"]?.ToString() ?? "").Trim('/');
             var remoteFiles = new JsonArray();
@@ -1438,7 +1442,7 @@ internal sealed class ApiBridge
                 ["name"] = name, ["localPath"] = remoteJob["localPath"]?.ToString() ?? localPath,
                 ["bucket"] = j["Bucket"]?.ToString(), ["s3Path"] = j["S3Path"]?.ToString(),
                 ["count"] = remoteFiles.Count, ["files"] = remoteFiles,
-                ["s3LiveChecked"] = true, ["s3LiveError"] = "",
+                ["s3LiveChecked"] = s3RemoteChecked, ["s3LiveError"] = s3RemoteError,
                 ["checkedAt"] = agent?["report"]?["generatedAt"]?.ToString() ?? DateTimeOffset.Now.ToString("o"),
                 ["source"] = "agent", ["agent"] = agent?["displayName"]?.ToString() ?? agent?["host"]?.ToString()
             }.ToJsonString());
@@ -1446,7 +1450,11 @@ internal sealed class ApiBridge
         if (!Directory.Exists(localPath))
             return ApiResponse.Json(500, new { error = $"Локальная папка недоступна: {localPath}" });
 
-        var s3 = await ListS3ObjectsAsync(j);
+        var s3 = new List<JsonObject>();
+        var s3Checked = true;
+        var s3Error = "";
+        try { s3 = await ListS3ObjectsAsync(j); }
+        catch (Exception ex) { s3Checked = false; s3Error = ex.Message; }
         var keys = new HashSet<string>(s3.Select(x => x["Key"]?.ToString() ?? ""), StringComparer.Ordinal);
         var root = (j["S3Path"]?.ToString() ?? "").Trim('/');
 
@@ -1473,8 +1481,8 @@ internal sealed class ApiBridge
             ["s3Path"] = j["S3Path"]?.ToString(),
             ["count"] = files.Count,
             ["files"] = files,
-            ["s3LiveChecked"] = true,
-            ["s3LiveError"] = "",
+            ["s3LiveChecked"] = s3Checked,
+            ["s3LiveError"] = s3Error,
             ["checkedAt"] = DateTimeOffset.Now.ToString("o")
         }.ToJsonString());
     }
@@ -1518,8 +1526,9 @@ internal sealed class ApiBridge
 
     private async Task<List<JsonObject>> ListS3ObjectsAsync(JsonObject j)
     {
-        var cfg = await ConfigAsync();
-        var endpoint = cfg["Global"]?["EndpointUrl"]?.ToString() ?? "";
+        var configuredProfile = j["AwsProfile"]?.ToString();
+        var profile = SafeProfileName(string.IsNullOrWhiteSpace(configuredProfile) ? "default" : configuredProfile);
+        var endpoint = await ResolveS3EndpointAsync(profile);
         var bucket = j["Bucket"]?.ToString() ?? "";
         var root = (j["S3Path"]?.ToString() ?? "").Trim('/');
         var prefix = root.Length > 0 ? $"{root}/{j["FilePrefix"]}" : j["FilePrefix"]?.ToString() ?? "";
@@ -1527,8 +1536,8 @@ internal sealed class ApiBridge
         var args = new List<string> {
             "--endpoint-url", endpoint
         };
-        var profile = j["AwsProfile"]?.ToString() ?? "";
-        if (profile.Length > 0) { args.Add("--profile"); args.Add(profile); }
+        args.Add("--profile");
+        args.Add(profile);
         args.AddRange(new[]{"s3api","list-objects-v2","--bucket",bucket,"--prefix",prefix,"--output","json"});
 
         var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
@@ -1547,6 +1556,22 @@ internal sealed class ApiBridge
             });
         }
         return list.OrderByDescending(x => DateTimeOffset.TryParse(x["LastModified"]?.ToString(), out var d) ? d : DateTimeOffset.MinValue).ToList();
+    }
+
+    private async Task<string> ResolveS3EndpointAsync(string profile)
+    {
+        profile = SafeProfileName(string.IsNullOrWhiteSpace(profile) ? "default" : profile);
+        var config = ReadIni(AppPaths.AwsConfigPath);
+        var configName = profile.Equals("default", StringComparison.OrdinalIgnoreCase) ? "default" : "profile " + profile;
+        var endpoint = config.GetValueOrDefault(configName)?.GetValueOrDefault("endpoint_url", "")?.Trim() ?? "";
+        if (endpoint.Length == 0)
+        {
+            var global = await ConfigAsync();
+            endpoint = global["Global"]?["EndpointUrl"]?.ToString()?.Trim() ?? "";
+        }
+        if (endpoint.Length == 0 || endpoint.Contains("s3.example.com", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Для S3-профиля «{profile}» не настроен адрес endpoint. Откройте «Профили и S3», укажите адрес хранилища и сохраните профиль.");
+        return endpoint;
     }
 
     private async Task<ApiResponse> AddJobAsync(string body)
