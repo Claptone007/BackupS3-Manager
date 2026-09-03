@@ -188,6 +188,7 @@ function New-UncheckedDashboardState {
 
         Bucket=[string]$Job.Bucket
         S3Path=[string]$Job.S3Path
+        AwsProfile=[string]$Job.AwsProfile
         S3Key=$null
         S3ObjectCount=0
         S3TotalBytes=0
@@ -249,6 +250,7 @@ foreach($configured in $effectiveJobs){
         $row.LocalPath=[string]$configured.LocalPath
         $row.Bucket=[string]$configured.Bucket
         $row.S3Path=[string]$configured.S3Path
+        $row.AwsProfile=[string]$configured.AwsProfile
         $row.Keep=[int]$configured.Keep
         $row.ExpectedBackupTime=[string]$configured.ExpectedBackupTime
         $row.ExpectedDays=[string]$configured.ExpectedDays
@@ -554,6 +556,20 @@ if(Test-Path $uiSettingsFile){
     try{$uiSettings=Get-Content $uiSettingsFile -Raw -Encoding UTF8|ConvertFrom-Json}catch{}
 }
 
+$s3AliasesFile=Join-Path $PSScriptRoot "State\s3-profile-aliases.json"
+$s3Aliases=[PSCustomObject]@{}
+if(Test-Path $s3AliasesFile){
+    try{$s3Aliases=Get-Content $s3AliasesFile -Raw -Encoding UTF8|ConvertFrom-Json}catch{}
+}
+function Get-S3ProfileLabel {
+    param([AllowEmptyString()][string]$Profile)
+    $technical=if([string]::IsNullOrWhiteSpace($Profile)){"default"}else{$Profile.Trim()}
+    $aliasProperty=$s3Aliases.PSObject.Properties[$technical]
+    $alias=if($null-ne$aliasProperty){[string]$aliasProperty.Value}else{""}
+    if([string]::IsNullOrWhiteSpace($alias)-or $alias-eq$technical){return $technical}
+    return "$alias ($technical)"
+}
+
 function Get-JobUi {
     param([string]$Name)
     $default=[PSCustomObject]@{
@@ -624,6 +640,7 @@ $rows = New-Object System.Text.StringBuilder
 foreach ($entry in $displayJobs) {
     $job=$entry.Job
     $jobUi=$entry.Ui
+    $s3ProfileLabel=Get-S3ProfileLabel ([string]$job.AwsProfile)
     $assignedAgentId=[string]$job.AgentId
     $matchedAgent=@($registeredAgents|Where-Object{$assignedAgentId -and [string]$_.id -eq $assignedAgentId}|Select-Object -First 1)
     if(-not $matchedAgent.Count){
@@ -794,6 +811,7 @@ foreach ($entry in $displayJobs) {
     <td>$([string]$job.AgeHours) ч</td>
     <td>
         <div>$(ConvertTo-HtmlSafe ("s3://{0}/{1}" -f $job.Bucket, $job.S3Path))</div>
+        <div class="s3-profile-ref">Профиль: $(ConvertTo-HtmlSafe $s3ProfileLabel)</div>
         <div class="muted">$(ConvertTo-HtmlSafe $job.S3Key)</div>
     </td>
     <td class="$retentionClass">$objectsHtml<div class="muted">Хранить: $(ConvertTo-HtmlSafe $job.Keep) файла</div></td>
@@ -2333,6 +2351,21 @@ html[data-theme="light"] #recentEventTooltip{
 [data-manual-upload-progress] {
     display:none !important;
 }
+</style>
+
+<style>
+    .s3-profile-ref{
+        display:inline-flex;
+        margin-top:5px;
+        padding:2px 7px;
+        border:1px solid #285777;
+        border-radius:999px;
+        background:#102534;
+        color:#67c9ff;
+        font-size:11px;
+        font-weight:700;
+        white-space:nowrap;
+    }
 </style>
 
 <style>
@@ -5207,8 +5240,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.6');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.6';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.7');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.7';});
 
         updateSettingsDangerState();
         return s;
@@ -5982,7 +6015,10 @@ html[data-theme="light"] #recentEventTooltip{
             checked.textContent=
                 'Проверено локально: '+fmtDateClient(data.checkedAt)+
                 ' · '+data.localPath+
-                ' · назначение: s3://'+data.bucket+'/'+data.s3Path;
+                ' · назначение: s3://'+data.bucket+'/'+data.s3Path+
+                ' · профиль S3: '+(data.awsProfileDisplay&&data.awsProfileDisplay!==data.awsProfile
+                    ?data.awsProfileDisplay+' ('+data.awsProfile+')'
+                    :(data.awsProfile||'default'));
             if(data.s3LiveChecked===false && data.s3LiveError){
                 editJobError.textContent='Локальные файлы найдены. S3 пока не проверен: '+data.s3LiveError;
             }
@@ -6147,6 +6183,9 @@ html[data-theme="light"] #recentEventTooltip{
             checked.textContent=
                 'Проверено напрямую в S3: '+fmtDateClient(data.checkedAt)+
                 ' · s3://'+data.bucket+'/'+data.s3Path+
+                ' · профиль S3: '+(data.awsProfileDisplay&&data.awsProfileDisplay!==data.awsProfile
+                    ?data.awsProfileDisplay+' ('+data.awsProfile+')'
+                    :(data.awsProfile||'default'))+
                 ' · префикс: '+data.prefix+
                 (excess>0?' · лишних: '+excess:'');
 

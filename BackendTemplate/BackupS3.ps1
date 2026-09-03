@@ -312,7 +312,12 @@ function Invoke-AwsCli {
             }
         }
 
-        return [PSCustomObject]@{ExitCode=$exit;Output=($parts -join [Environment]::NewLine)}
+        return [PSCustomObject]@{
+            ExitCode=$exit
+            StdOut=[string]$stdout
+            StdErr=[string]$stderr
+            Output=($parts -join [Environment]::NewLine)
+        }
     }catch{
         if($_.Exception.Message -eq "Проверка отменена пользователем"){throw}
         return [PSCustomObject]@{ExitCode=999;Output=$_.Exception.Message}
@@ -343,8 +348,8 @@ function Get-S3Inventory {
     if ($r.ExitCode -ne 0) { throw "S3 list failed: $($r.Output)" }
 
     $objects=@()
-    if ($r.Output) {
-        $j=$r.Output|ConvertFrom-Json
+    if ($r.StdOut) {
+        $j=$r.StdOut|ConvertFrom-Json
         if ($null -ne $j.Contents) { $objects=@($j.Contents) }
     }
     $script:S3InventoryCache[$cacheKey]=$objects

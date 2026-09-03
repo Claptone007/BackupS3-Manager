@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.6";
+    private const string CurrentVersion = "24.7";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1441,6 +1441,7 @@ internal sealed class ApiBridge
             return ApiResponse.JsonText(200, new JsonObject {
                 ["name"] = name, ["localPath"] = remoteJob["localPath"]?.ToString() ?? localPath,
                 ["bucket"] = j["Bucket"]?.ToString(), ["s3Path"] = j["S3Path"]?.ToString(),
+                ["awsProfile"] = EffectiveAwsProfile(j), ["awsProfileDisplay"] = GetS3DisplayName(EffectiveAwsProfile(j)),
                 ["count"] = remoteFiles.Count, ["files"] = remoteFiles,
                 ["s3LiveChecked"] = s3RemoteChecked, ["s3LiveError"] = s3RemoteError,
                 ["checkedAt"] = agent?["report"]?["generatedAt"]?.ToString() ?? DateTimeOffset.Now.ToString("o"),
@@ -1479,6 +1480,8 @@ internal sealed class ApiBridge
             ["localPath"] = localPath,
             ["bucket"] = j["Bucket"]?.ToString(),
             ["s3Path"] = j["S3Path"]?.ToString(),
+            ["awsProfile"] = EffectiveAwsProfile(j),
+            ["awsProfileDisplay"] = GetS3DisplayName(EffectiveAwsProfile(j)),
             ["count"] = files.Count,
             ["files"] = files,
             ["s3LiveChecked"] = s3Checked,
@@ -1500,6 +1503,8 @@ internal sealed class ApiBridge
             ["name"] = name,
             ["bucket"] = j["Bucket"]?.ToString(),
             ["s3Path"] = j["S3Path"]?.ToString(),
+            ["awsProfile"] = EffectiveAwsProfile(j),
+            ["awsProfileDisplay"] = GetS3DisplayName(EffectiveAwsProfile(j)),
             ["prefix"] = prefix,
             ["count"] = objects.Count,
             ["objects"] = new JsonArray(objects.Select(x => (JsonNode?)x).ToArray()),
@@ -1526,8 +1531,7 @@ internal sealed class ApiBridge
 
     private async Task<List<JsonObject>> ListS3ObjectsAsync(JsonObject j)
     {
-        var configuredProfile = j["AwsProfile"]?.ToString();
-        var profile = SafeProfileName(string.IsNullOrWhiteSpace(configuredProfile) ? "default" : configuredProfile);
+        var profile = EffectiveAwsProfile(j);
         var endpoint = await ResolveS3EndpointAsync(profile);
         var bucket = j["Bucket"]?.ToString() ?? "";
         var root = (j["S3Path"]?.ToString() ?? "").Trim('/');
@@ -1556,6 +1560,12 @@ internal sealed class ApiBridge
             });
         }
         return list.OrderByDescending(x => DateTimeOffset.TryParse(x["LastModified"]?.ToString(), out var d) ? d : DateTimeOffset.MinValue).ToList();
+    }
+
+    private static string EffectiveAwsProfile(JsonObject job)
+    {
+        var configured = job["AwsProfile"]?.ToString();
+        return SafeProfileName(string.IsNullOrWhiteSpace(configured) ? "default" : configured);
     }
 
     private async Task<string> ResolveS3EndpointAsync(string profile)
