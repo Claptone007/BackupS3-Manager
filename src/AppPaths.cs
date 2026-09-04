@@ -98,6 +98,8 @@ internal static class AppPaths
             var rel = Path.GetRelativePath(TemplateRoot, src);
             if (rel.Equals("Start-DashboardServer.ps1", StringComparison.OrdinalIgnoreCase))
                 continue;
+            if (rel.StartsWith("Web" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                continue;
 
             var dst = Path.Combine(DataRoot, rel);
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);

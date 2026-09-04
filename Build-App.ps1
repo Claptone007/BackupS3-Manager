@@ -36,6 +36,17 @@ $cleanConfig=Join-Path $here "installer\BackupJobs.clean.psd1"
 $publishedConfig=Join-Path $out "BackendTemplate\BackupJobs.psd1"
 Copy-Item -LiteralPath $cleanConfig -Destination $publishedConfig -Force
 
+# Сгенерированный Dashboard содержит снимок конкретной конфигурации и никогда
+# не должен попадать в публичную сборку. На целевом ПК он создаётся заново.
+$publishedWeb=Join-Path $out "BackendTemplate\Web"
+if(Test-Path -LiteralPath $publishedWeb){
+    $resolvedWeb=(Resolve-Path -LiteralPath $publishedWeb).Path
+    if(-not $resolvedWeb.StartsWith($out+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
+        throw "Небезопасный путь очистки Dashboard: $resolvedWeb"
+    }
+    Remove-Item -LiteralPath $resolvedWeb -Recurse -Force
+}
+
 $fixedRuntime=Join-Path $here "runtime\WebView2Runtime"
 if(Test-Path -LiteralPath $fixedRuntime -PathType Container){
     $runtimeOut=Join-Path $out "WebView2Runtime"

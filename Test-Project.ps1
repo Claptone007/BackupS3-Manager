@@ -44,5 +44,15 @@ foreach($f in Get-ChildItem $backend -Filter *.ps1 -File){
     Write-Host "[OK] PS syntax: $($f.Name)" -ForegroundColor Green
 }
 
+$projectSource=Get-Content (Join-Path $root "src\BackupS3Manager.csproj") -Raw -Encoding UTF8
+$buildSource=Get-Content (Join-Path $root "Build-App.ps1") -Raw -Encoding UTF8
+if($projectSource -notmatch 'BackendTemplate\\Web\\\*\*\\\*'){
+    throw "Public build does not exclude generated BackendTemplate/Web files"
+}
+if($buildSource -notmatch 'publishedWeb'){
+    throw "Build-App.ps1 does not clean generated Dashboard files"
+}
+Write-Host "[OK] generated Dashboard is excluded from public builds" -ForegroundColor Green
+
 Write-Host ""
 Write-Host "Project structure OK." -ForegroundColor Green

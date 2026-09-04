@@ -3492,7 +3492,7 @@ html[data-theme="light"] #recentEventTooltip{
             const r=await fetch('/api/startup-workspace/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Mode:selected,AutoEnter:!!autoEnter})});
             if(!r.ok){let t=await r.text();try{t=JSON.parse(t).error||t}catch(_){}throw new Error(t);}
             sessionStorage.setItem('backupS3WorkspaceChosen','1');
-            location.reload();
+            location.replace('index.html?t='+Date.now());
         }catch(e){startupWorkspaceError.textContent=e.message;startupWorkspaceContinue.disabled=false;startupWorkspaceContinue.textContent='Продолжить';}
     }
     startupWorkspaceContinue.addEventListener('click',async()=>{
@@ -4002,7 +4002,7 @@ html[data-theme="light"] #recentEventTooltip{
         try{
             const response=await fetch('/api/jobs/delete-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Names:names})});
             if(!response.ok){let text=await response.text();try{text=JSON.parse(text).error||text}catch(_){}throw new Error(text);}
-            location.reload();
+            location.replace('index.html?t='+Date.now());
         }catch(e){
             deleteSelectedButton.disabled=false;selectedButton.disabled=false;selectAllJobsButton.disabled=false;
             await showAppDialog({title:'Ошибка удаления',message:e.message,kind:'error'});
@@ -5244,8 +5244,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.8');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.8';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.9');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.9';});
 
         updateSettingsDangerState();
         return s;
@@ -6597,7 +6597,7 @@ html[data-theme="light"] #recentEventTooltip{
                     throw new Error(await response.text());
                 }
 
-                location.reload();
+                location.replace('index.html?t='+Date.now());
             }
             catch (e) {
                 button.disabled = false;
