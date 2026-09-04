@@ -2,12 +2,12 @@
   <Package
       Name="Backup S3 Manager"
       Manufacturer="BackupS3"
-      Version="23.0.17"
+      Version="24.8.0"
       UpgradeCode="6FB62AC6-9B68-4A57-B01A-4E1F21A7B123"
       Scope="perMachine">
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Backup S3 Manager is already installed." />
-    <MediaTemplate EmbedCab="yes" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="low" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="BackupS3 Manager" />
