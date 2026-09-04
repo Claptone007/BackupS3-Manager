@@ -18,7 +18,7 @@ internal static class Program
         try
         {
             AppPaths.Initialize();
-            AppLog.Info("BackupS3 Manager v24.12 запускается");
+            AppLog.Info("BackupS3 Manager v24.13 запускается");
 
             var startInBackground = args.Any(x => x.Equals("--background", StringComparison.OrdinalIgnoreCase));
             if (startInBackground)

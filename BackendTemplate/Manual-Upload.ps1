@@ -441,6 +441,13 @@ try{
                 }
             }
 
+            # HasExited may become true before redirected streams and the native
+            # exit code are fully committed. WaitForExit is required here;
+            # otherwise a completed-looking operation can be reported with a
+            # stale exit code and incomplete output.
+            $p.WaitForExit()
+            $p.Refresh()
+
             $stdout=if(Test-Path $outFile){Get-Content $outFile -Raw -ErrorAction SilentlyContinue}else{""}
             $stderr=if(Test-Path $errFile){Get-Content $errFile -Raw -ErrorAction SilentlyContinue}else{""}
             return [PSCustomObject]@{
@@ -492,7 +499,7 @@ try{
     $verifyResult=$null
     $verifyExit=1
     $verified=$false
-    $verifyAttempts=8
+    $verifyAttempts=30
 
     for($verifyAttempt=1;$verifyAttempt -le $verifyAttempts;$verifyAttempt++){
         $verifyResult=Invoke-AwsNative -Arguments $headArgs
@@ -518,6 +525,36 @@ try{
                 )
             }catch{
                 Write-UploadLog "Verify JSON parse failed: $($_.Exception.Message)"
+            }
+        }
+
+
+        # Some S3-compatible services return a temporary 404 for HEAD while
+        # the object is already visible through ListObjectsV2. Verify the exact
+        # key and size through LIST as a provider-compatible fallback.
+        if(-not$verified){
+            $exactListArgs=$aws+@(
+                "s3api","list-objects-v2",
+                "--bucket",[string]$job.Bucket,
+                "--prefix",$key,
+                "--max-keys","5",
+                "--output","json"
+            )
+            $exactListResult=Invoke-AwsNative -Arguments $exactListArgs
+            Write-UploadLog (
+                "Verify list fallback attempt={0}/{1} exit={2} output={3}" -f
+                $verifyAttempt,$verifyAttempts,$exactListResult.ExitCode,$exactListResult.Output
+            )
+            if($exactListResult.ExitCode -eq 0 -and -not[string]::IsNullOrWhiteSpace($exactListResult.StdOut)){
+                try{
+                    $listed=$exactListResult.StdOut|ConvertFrom-Json
+                    $match=@($listed.Contents|Where-Object{
+                        [string]$_.Key -ceq $key -and [Int64]$_.Size -eq [Int64]$item.Length
+                    }|Select-Object -First 1)
+                    if($match.Count -gt 0){$verified=$true;break}
+                }catch{
+                    Write-UploadLog "Verify LIST JSON parse failed: $($_.Exception.Message)"
+                }
             }
         }
 
