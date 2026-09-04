@@ -2677,10 +2677,8 @@ html[data-theme="light"] #recentEventTooltip{
 
                     <label>
                         <span>S3-бакет <i class="field-help" data-help="Имя хранилища S3, в которое отправляются файлы этой базы.">?</i></span>
-                        <select id="jobBucket" required>
-                            <option value="pw1" selected>pw1</option>
-                            <option value="kom1">kom1</option>
-                        </select>
+                        <input id="jobBucket" list="jobBucketOptions" required placeholder="Выберите или введите bucket">
+                        <datalist id="jobBucketOptions"></datalist>
                     </label>
 
                     <label class="s3-folder-field">
@@ -2838,10 +2836,8 @@ html[data-theme="light"] #recentEventTooltip{
 
                     <label>
                         <span>S3-бакет <i class="field-help" data-help="Имя хранилища S3 для этой базы.">?</i></span>
-                        <select id="editBucket">
-                            <option value="pw1">pw1</option>
-                            <option value="kom1">kom1</option>
-                        </select>
+                        <input id="editBucket" list="editBucketOptions" required placeholder="Выберите или введите bucket">
+                        <datalist id="editBucketOptions"></datalist>
                     </label>
 
                     <label>
@@ -3208,6 +3204,8 @@ html[data-theme="light"] #recentEventTooltip{
                         <div class="secret-input"><input id="s3SessionToken" type="password" autocomplete="new-password" placeholder="Session Token (необязательно)"><button class="toggle-secret" type="button" data-target="s3SessionToken">Показать</button></div>
                         <input id="s3Region" placeholder="Регион, например ru-1">
                         <input id="s3Endpoint" type="url" placeholder="Endpoint, например https://s3.example.ru">
+                        <textarea id="s3Buckets" rows="2" placeholder="Бакеты: pw1, archive, backups"></textarea>
+                        <small class="field-hint">Доступные этому профилю бакеты — через запятую или с новой строки.</small>
                         <div class="manager-actions"><button id="clearS3ProfileForm" type="button">Очистить</button><button class="primary-button" type="submit">Сохранить S3-профиль</button></div>
                     </form>
                 </section>
@@ -5055,7 +5053,7 @@ html[data-theme="light"] #recentEventTooltip{
     }
 
     function clearS3Form(){
-        ['s3ProfileName','s3DisplayName','s3AccessKey','s3SecretKey','s3SessionToken','s3Region','s3Endpoint'].forEach(function(id){document.getElementById(id).value='';});
+        ['s3ProfileName','s3DisplayName','s3AccessKey','s3SecretKey','s3SessionToken','s3Region','s3Endpoint','s3Buckets'].forEach(function(id){document.getElementById(id).value='';});
     }
 
     async function loadRuntimeStatus(){
@@ -5080,19 +5078,24 @@ html[data-theme="light"] #recentEventTooltip{
         finally{button.disabled=false;button.textContent=old;}
     }
 
+    let s3ProfileCatalog=[];
+    function profileKey(value){return String(value||'default').trim()||'default';}
+    function bucketsForProfile(value){const key=profileKey(value);const profile=s3ProfileCatalog.find(x=>String(x.name||'').toLowerCase()===key.toLowerCase());return profile&&Array.isArray(profile.buckets)?profile.buckets:[];}
+    function fillBucketOptions(listId,profileValue,currentInput){const list=document.getElementById(listId);if(!list)return;const buckets=bucketsForProfile(profileValue);list.innerHTML='';buckets.forEach(bucket=>{const option=document.createElement('option');option.value=bucket;list.appendChild(option);});if(currentInput&&!currentInput.value&&buckets.length===1)currentInput.value=buckets[0];}
+    async function refreshS3ProfileCatalog(){const data=await apiJson('/api/s3-profiles?t='+Date.now());s3ProfileCatalog=data.profiles||[];return data;}
     async function loadS3Profiles(){
-        const data=await apiJson('/api/s3-profiles?t='+Date.now());
+        const data=await refreshS3ProfileCatalog();
         const list=document.getElementById('s3ProfilesList');list.innerHTML='';
         (data.profiles||[]).forEach(function(profile){
             const row=document.createElement('div');row.className='manager-row';
             const main=document.createElement('div');main.className='manager-row-main';
             const strong=document.createElement('strong');strong.textContent=profile.displayName||profile.name;
-            const meta=document.createElement('span');meta.textContent=(profile.accessKey||'Ключ не задан')+(profile.endpoint?' · '+profile.endpoint:'');
+            const meta=document.createElement('span');const buckets=Array.isArray(profile.buckets)&&profile.buckets.length?profile.buckets.join(', '):'не указаны';meta.textContent=(profile.accessKey||'Ключ не задан')+(profile.endpoint?' · '+profile.endpoint:'')+' · Бакеты: '+buckets;
             main.append(strong,meta);row.appendChild(main);
             const reveal=document.createElement('button');reveal.type='button';reveal.textContent='Показать';
             reveal.addEventListener('click',async function(){
                 try{const full=await apiJson('/api/s3-profiles/reveal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name})});
-                    document.getElementById('s3ProfileName').value=full.name||'';document.getElementById('s3DisplayName').value=full.displayName||full.name||'';document.getElementById('s3AccessKey').value=full.accessKey||'';document.getElementById('s3SecretKey').value=full.secretKey||'';document.getElementById('s3SessionToken').value=full.sessionToken||'';document.getElementById('s3Region').value=full.region||'';document.getElementById('s3Endpoint').value=full.endpoint||'';
+                    document.getElementById('s3ProfileName').value=full.name||'';document.getElementById('s3DisplayName').value=full.displayName||full.name||'';document.getElementById('s3AccessKey').value=full.accessKey||'';document.getElementById('s3SecretKey').value=full.secretKey||'';document.getElementById('s3SessionToken').value=full.sessionToken||'';document.getElementById('s3Region').value=full.region||'';document.getElementById('s3Endpoint').value=full.endpoint||'';document.getElementById('s3Buckets').value=(full.buckets||[]).join(', ');
                 }catch(e){profilesError.textContent=e.message;}
             });row.appendChild(reveal);
             const test=document.createElement('button');test.type='button';test.textContent='Проверить';test.addEventListener('click',async function(){try{test.disabled=true;test.textContent='Проверяю…';let runtime=await loadRuntimeStatus();if(!runtime.awsInstalled){if(!await installAwsCli())return;runtime=await loadRuntimeStatus();if(!runtime.awsInstalled)throw new Error('AWS CLI v2 не обнаружен после установки. Перезапустите BS3 и повторите проверку.');}const r=await apiJson('/api/s3-profiles/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name,Endpoint:profile.endpoint||''})});await showAppDialog({title:'S3-подключение',message:r.message||'Подключение успешно',kind:'info'});}catch(e){await showAppDialog({title:'Ошибка S3',message:e.message,kind:'error'});}finally{test.disabled=false;test.textContent='Проверить';}});row.appendChild(test);
@@ -5116,7 +5119,8 @@ html[data-theme="light"] #recentEventTooltip{
         try{
             const savedName=document.getElementById('s3ProfileName').value.trim();
             const displayName=document.getElementById('s3DisplayName').value.trim();
-            await apiJson('/api/s3-profiles/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:savedName,DisplayName:displayName,AccessKey:document.getElementById('s3AccessKey').value.trim(),SecretKey:document.getElementById('s3SecretKey').value.trim(),SessionToken:document.getElementById('s3SessionToken').value.trim(),Region:document.getElementById('s3Region').value.trim(),Endpoint:document.getElementById('s3Endpoint').value.trim()})});
+            const buckets=document.getElementById('s3Buckets').value.split(/[,;\n\r]+/).map(x=>x.trim()).filter(Boolean);
+            await apiJson('/api/s3-profiles/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:savedName,DisplayName:displayName,AccessKey:document.getElementById('s3AccessKey').value.trim(),SecretKey:document.getElementById('s3SecretKey').value.trim(),SessionToken:document.getElementById('s3SessionToken').value.trim(),Region:document.getElementById('s3Region').value.trim(),Endpoint:document.getElementById('s3Endpoint').value.trim(),Buckets:buckets})});
             clearS3Form();await loadS3Profiles();const runtime=await loadRuntimeStatus();
             if(runtime.awsInstalled){await showAppDialog({title:'S3-профиль сохранён',message:'Подключение «'+(displayName||savedName)+'» обнаружено и записано в стандартное хранилище AWS CLI. Можно выполнить проверку.',kind:'info'});}
             else if(await appConfirm('Подключение «'+(displayName||savedName)+'» сохранено и видно BackupS3.\n\nAWS CLI v2 не установлен, поэтому проверка и загрузка S3 пока недоступны. Установить официальный AWS CLI v2 сейчас?\n\nОтдельный Python для AWS CLI v2 не требуется.',{title:'Требуется AWS CLI v2',confirmText:'Установить'})){await installAwsCli(true);}
@@ -5240,8 +5244,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.7');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.7';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.8');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.8';});
 
         updateSettingsDangerState();
         return s;
@@ -5495,17 +5499,12 @@ html[data-theme="light"] #recentEventTooltip{
     const jobBucketInput = document.getElementById('jobBucket');
     const jobAwsProfileInput = document.getElementById('jobAwsProfile');
 
-    function applyBucketDefaults() {
-        if (jobBucketInput.value === 'kom1') {
-            jobAwsProfileInput.value = 'kom';
-        } else if (jobBucketInput.value === 'pw1' && jobAwsProfileInput.value === 'kom') {
-            jobAwsProfileInput.value = '';
-        }
-    }
+    function applyBucketDefaults() {}
 
     jobBucketInput.addEventListener('change', function () {
         applyBucketDefaults();
     });
+    jobAwsProfileInput.addEventListener('input',function(){fillBucketOptions('jobBucketOptions',this.value,jobBucketInput);});
 
     const jobS3PathInput = document.getElementById('jobS3Path');
     const loadS3FoldersButton = document.getElementById('loadS3FoldersButton');
@@ -5640,9 +5639,10 @@ html[data-theme="light"] #recentEventTooltip{
     const jobFilePrefix = document.getElementById('jobFilePrefix');
     const jobFormError = document.getElementById('jobFormError');
 
-    function openJobModal() {
+    async function openJobModal() {
         jobModal.hidden = false;
         document.body.classList.add('modal-open');
+        try{await refreshS3ProfileCatalog();fillBucketOptions('jobBucketOptions',jobAwsProfileInput.value,jobBucketInput);}catch(_){}
         jobName.focus();
     }
 
@@ -6321,6 +6321,7 @@ html[data-theme="light"] #recentEventTooltip{
         document.getElementById('editS3Path').value=d.S3Path||'';
         document.getElementById('editFilePrefix').value=d.FilePrefix||'';
         document.getElementById('editAwsProfile').value=d.AwsProfile||'';
+        try{await refreshS3ProfileCatalog();fillBucketOptions('editBucketOptions',d.AwsProfile||'',document.getElementById('editBucket'));}catch(_){}
         document.getElementById('editKeep').value=d.Keep||2;
         document.getElementById('editExpectedTime').value=d.ExpectedBackupTime||'';
         document.getElementById('editExpectedDays').value=d.ExpectedDays||'Daily';
@@ -6401,10 +6402,9 @@ html[data-theme="light"] #recentEventTooltip{
     });
 
     document.getElementById('editBucket').addEventListener('change',function(){
-        const profile=document.getElementById('editAwsProfile');
-        if(this.value==='kom1')profile.value='kom';
-        else if(profile.value==='kom')profile.value='';
+        // Bucket and AWS profile are now linked through the profile catalog.
     });
+    document.getElementById('editAwsProfile').addEventListener('input',function(){fillBucketOptions('editBucketOptions',this.value,document.getElementById('editBucket'));});
 
     editJobForm.addEventListener('submit',async function(e){
         e.preventDefault();

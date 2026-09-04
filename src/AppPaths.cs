@@ -125,7 +125,9 @@ internal static class AppPaths
             FileName = PowerShellExe(),
             WorkingDirectory = DataRoot,
             UseShellExecute = false,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
         };
         psi.ArgumentList.Add("-NoProfile");
         psi.ArgumentList.Add("-NonInteractive");
@@ -140,16 +142,29 @@ internal static class AppPaths
         if (p is null)
             throw new InvalidOperationException("Не удалось запустить Generate-Dashboard.ps1");
 
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
+        var stderrTask = p.StandardError.ReadToEndAsync();
+
         if (!p.WaitForExit(30000))
         {
             try { p.Kill(true); } catch { }
             throw new TimeoutException("Generate-Dashboard.ps1 не завершился за 30 секунд.");
         }
 
-        if (p.ExitCode != 0)
-            throw new InvalidOperationException($"Generate-Dashboard.ps1 завершился с кодом {p.ExitCode}.");
-
         var index = Path.Combine(WebDir, "index.html");
+        if (p.ExitCode != 0)
+        {
+            var details = (stderrTask.GetAwaiter().GetResult() + Environment.NewLine + stdoutTask.GetAwaiter().GetResult()).Trim();
+            AppLog.Error($"Generate-Dashboard.ps1 завершился с кодом {p.ExitCode}. {details}");
+            if (File.Exists(index))
+            {
+                AppLog.Warn("Используется последний успешно созданный Dashboard.");
+                return;
+            }
+            throw new InvalidOperationException($"Generate-Dashboard.ps1 завершился с кодом {p.ExitCode}." +
+                (details.Length > 0 ? Environment.NewLine + details : ""));
+        }
+
         if (!File.Exists(index))
             throw new FileNotFoundException("Dashboard не был создан.", index);
     }

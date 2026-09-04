@@ -6,9 +6,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>BackupS3Manager</AssemblyName>
-    <Version>24.7.0</Version>
-    <AssemblyVersion>24.7.0.0</AssemblyVersion>
-    <FileVersion>24.7.0.0</FileVersion>
+    <Version>24.8.0</Version>
+    <AssemblyVersion>24.8.0.0</AssemblyVersion>
+    <FileVersion>24.8.0.0</FileVersion>
     <RootNamespace>BackupS3Manager</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\BackupS3-BS3.ico</ApplicationIcon>

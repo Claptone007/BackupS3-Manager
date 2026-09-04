@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.7";
+    private const string CurrentVersion = "24.8";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -760,6 +760,7 @@ internal sealed class ApiBridge
     }
 
     private static string S3AliasesPath => Path.Combine(AppPaths.StateDir, "s3-profile-aliases.json");
+    private static string S3BucketsPath => Path.Combine(AppPaths.StateDir, "s3-profile-buckets.json");
 
     private static string SafeDisplayName(string? value, string fallback)
     {
@@ -773,6 +774,19 @@ internal sealed class ApiBridge
     {
         var aliases = ReadObject(S3AliasesPath, new JsonObject());
         return aliases[profile]?.ToString()?.Trim() is { Length: > 0 } value ? value : profile;
+    }
+
+    private static JsonArray GetS3Buckets(string profile)
+    {
+        var stored = ReadObject(S3BucketsPath, new JsonObject());
+        var result = new JsonArray();
+        if (stored[profile] is JsonArray buckets)
+            foreach (var item in buckets)
+            {
+                var bucket = item?.ToString()?.Trim() ?? "";
+                if (bucket.Length > 0) result.Add(bucket);
+            }
+        return result;
     }
 
     private static JsonObject S3ProfileJson(string name, Dictionary<string, string> credentials, Dictionary<string, string>? config, bool reveal)
@@ -790,6 +804,7 @@ internal sealed class ApiBridge
             ["sessionToken"] = reveal ? token : (token.Length > 0 ? Mask(token) : ""),
             ["region"] = config?.GetValueOrDefault("region", "") ?? "",
             ["endpoint"] = config?.GetValueOrDefault("endpoint_url", "") ?? "",
+            ["buckets"] = GetS3Buckets(name),
             ["hasAccessKey"] = access.Length > 0,
             ["hasSecretKey"] = secret.Length > 0,
             ["hasSessionToken"] = token.Length > 0,
@@ -825,6 +840,15 @@ internal sealed class ApiBridge
         var request = ParseBody(body);
         var name = SafeProfileName(request["Name"]?.ToString());
         var displayName = SafeDisplayName(request["DisplayName"]?.ToString(), name);
+        var buckets = new List<string>();
+        if (request["Buckets"] is JsonArray requestedBuckets)
+            foreach (var item in requestedBuckets)
+            {
+                var bucket = item?.ToString()?.Trim() ?? "";
+                if (bucket.Length == 0) continue;
+                if (!IsValidBucket(bucket)) return ApiResponse.Json(400, new { error = $"Некорректное имя S3-бакета: {bucket}" });
+                if (!buckets.Contains(bucket, StringComparer.OrdinalIgnoreCase)) buckets.Add(bucket);
+            }
         var credentials = ReadIni(AppPaths.AwsCredentialsPath);
         var existing = credentials.GetValueOrDefault(name) ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var access = request["AccessKey"]?.ToString()?.Trim() ?? "";
@@ -850,7 +874,12 @@ internal sealed class ApiBridge
         var aliases = ReadObject(S3AliasesPath, new JsonObject());
         aliases[name] = displayName;
         WriteObjectAtomic(S3AliasesPath, aliases);
-        return ApiResponse.Json(200, new { status = "saved", name, displayName, credentialsFile = AppPaths.AwsCredentialsPath });
+        var bucketMap = ReadObject(S3BucketsPath, new JsonObject());
+        var bucketArray = new JsonArray();
+        foreach (var bucket in buckets) bucketArray.Add(bucket);
+        bucketMap[name] = bucketArray;
+        WriteObjectAtomic(S3BucketsPath, bucketMap);
+        return ApiResponse.Json(200, new { status = "saved", name, displayName, buckets, credentialsFile = AppPaths.AwsCredentialsPath });
     }
 
     private static ApiResponse DeleteS3Profile(string body)
@@ -865,6 +894,9 @@ internal sealed class ApiBridge
         var aliases = ReadObject(S3AliasesPath, new JsonObject());
         aliases.Remove(name);
         WriteObjectAtomic(S3AliasesPath, aliases);
+        var bucketMap = ReadObject(S3BucketsPath, new JsonObject());
+        bucketMap.Remove(name);
+        WriteObjectAtomic(S3BucketsPath, bucketMap);
         return ApiResponse.Json(200, new { status = "deleted", name });
     }
 
