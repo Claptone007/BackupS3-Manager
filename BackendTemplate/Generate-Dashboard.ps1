@@ -110,6 +110,20 @@ function Set-ObjectProperty {
     $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
 }
 
+function Get-DisplayedS3Endpoint {
+    param([string]$Fallback)
+    $awsConfig=Join-Path $env:USERPROFILE ".aws\config"
+    if(Test-Path $awsConfig -PathType Leaf){
+        foreach($line in Get-Content $awsConfig -Encoding UTF8){
+            if($line -match '^\s*endpoint_url\s*=\s*(.+?)\s*$'){
+                $candidate=$matches[1].Trim()
+                if($candidate){return $candidate}
+            }
+        }
+    }
+    return $Fallback
+}
+
 function Get-EffectiveDashboardJobs {
     param(
         $BaseJobs,
@@ -846,6 +860,7 @@ foreach ($entry in $displayJobs) {
 $generated = Format-DateValue $state.GeneratedAt
 $cssHref = Split-Path $cssFile -Leaf
 
+$displayEndpoint=Get-DisplayedS3Endpoint ([string]$state.Endpoint)
 $html = @"
 <!doctype html>
 <html lang="ru">
@@ -2491,7 +2506,7 @@ html[data-theme="light"] #recentEventTooltip{
                 <span class="theme-icon" aria-hidden="true">☀</span>
                 <span id="themeLabel">Светлая</span>
             </button>
-            <div class="endpoint">$(ConvertTo-HtmlSafe $state.Endpoint)</div>
+            <div class="endpoint">$(ConvertTo-HtmlSafe $displayEndpoint)</div>
         </div>
     </header>
 
@@ -2713,7 +2728,8 @@ html[data-theme="light"] #recentEventTooltip{
 
                     <label>
                         <span>Профиль AWS <i class="field-help" data-help="Профиль с ключами доступа S3. Пустое значение использует стандартный профиль AWS.">?</i></span>
-                        <input id="jobAwsProfile" placeholder="пусто = стандартный">
+                        <input id="jobAwsProfile" list="jobAwsProfileOptions" placeholder="Выберите сохранённый профиль">
+                        <datalist id="jobAwsProfileOptions"></datalist>
                     </label>
 
                     <label>
@@ -5097,8 +5113,10 @@ html[data-theme="light"] #recentEventTooltip{
     let s3ProfileCatalog=[];
     function profileKey(value){return String(value||'default').trim()||'default';}
     function bucketsForProfile(value){const key=profileKey(value);const profile=s3ProfileCatalog.find(x=>String(x.name||'').toLowerCase()===key.toLowerCase());return profile&&Array.isArray(profile.buckets)?profile.buckets:[];}
+    function fillProfileOptions(){const list=document.getElementById('jobAwsProfileOptions');if(!list)return;list.innerHTML='';s3ProfileCatalog.forEach(profile=>{const option=document.createElement('option');option.value=profile.name||'';option.label=profile.displayName||profile.name||'';list.appendChild(option);});}
+    function inferProfileFromBucket(bucket){const value=String(bucket||'').trim().toLowerCase();if(!value)return'';const matches=s3ProfileCatalog.filter(profile=>(profile.buckets||[]).some(item=>String(item).toLowerCase()===value));return matches.length===1?String(matches[0].name||''):'';}
     function fillBucketOptions(listId,profileValue,currentInput){const list=document.getElementById(listId);if(!list)return;const buckets=bucketsForProfile(profileValue);list.innerHTML='';buckets.forEach(bucket=>{const option=document.createElement('option');option.value=bucket;list.appendChild(option);});if(currentInput&&!currentInput.value&&buckets.length===1)currentInput.value=buckets[0];}
-    async function refreshS3ProfileCatalog(){const data=await apiJson('/api/s3-profiles?t='+Date.now());s3ProfileCatalog=data.profiles||[];return data;}
+    async function refreshS3ProfileCatalog(){const data=await apiJson('/api/s3-profiles?t='+Date.now());s3ProfileCatalog=data.profiles||[];fillProfileOptions();return data;}
     async function loadS3Profiles(){
         const data=await refreshS3ProfileCatalog();
         const list=document.getElementById('s3ProfilesList');list.innerHTML='';
@@ -5260,8 +5278,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.11');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.11';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.12');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.12';});
 
         updateSettingsDangerState();
         return s;
@@ -5518,6 +5536,7 @@ html[data-theme="light"] #recentEventTooltip{
     function applyBucketDefaults() {}
 
     jobBucketInput.addEventListener('change', function () {
+        if(!jobAwsProfileInput.value.trim()){const inferred=inferProfileFromBucket(jobBucketInput.value);if(inferred)jobAwsProfileInput.value=inferred;}
         applyBucketDefaults();
     });
     jobAwsProfileInput.addEventListener('input',function(){fillBucketOptions('jobBucketOptions',this.value,jobBucketInput);});
@@ -5658,7 +5677,7 @@ html[data-theme="light"] #recentEventTooltip{
     async function openJobModal() {
         jobModal.hidden = false;
         document.body.classList.add('modal-open');
-        try{await refreshS3ProfileCatalog();fillBucketOptions('jobBucketOptions',jobAwsProfileInput.value,jobBucketInput);}catch(_){}
+        try{await refreshS3ProfileCatalog();if(!jobAwsProfileInput.value&&s3ProfileCatalog.length===1)jobAwsProfileInput.value=s3ProfileCatalog[0].name||'';fillBucketOptions('jobBucketOptions',jobAwsProfileInput.value,jobBucketInput);}catch(_){}
         jobName.focus();
     }
 

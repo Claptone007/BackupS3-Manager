@@ -194,7 +194,20 @@ function Invoke-AwsCli {
         }
     }
 
-    $a=@("--endpoint-url",$script:EndpointUrl)
+    $profileName=if([string]::IsNullOrWhiteSpace($Profile)){"default"}else{[string]$Profile}
+    $profileEndpoint=""
+    $awsConfig=Join-Path $env:USERPROFILE ".aws\config"
+    if(Test-Path $awsConfig -PathType Leaf){
+        $wanted=if($profileName -ieq "default"){"default"}else{"profile $profileName"}
+        $section=""
+        foreach($line in Get-Content $awsConfig -Encoding UTF8){
+            if($line -match '^\s*\[([^]]+)\]\s*$'){$section=$matches[1].Trim();continue}
+            if($section -ieq $wanted -and $line -match '^\s*endpoint_url\s*=\s*(.+?)\s*$'){$profileEndpoint=$matches[1].Trim();break}
+        }
+    }
+    $endpoint=if($profileEndpoint){$profileEndpoint}else{[string]$script:EndpointUrl}
+    $a=@()
+    if($endpoint -and $endpoint -notmatch 's3\.example\.com'){$a+=@("--endpoint-url",$endpoint)}
     if(-not[string]::IsNullOrWhiteSpace($Profile)){$a+=@("--profile",$Profile)}
     $a+=$effectiveArguments
 
@@ -494,6 +507,22 @@ function Get-EffectiveJobs {
     foreach($j in $added){ if($deleted -notcontains [string]$j.Name){ $byName[[string]$j.Name]=$j } }
 
     $effective=@()
+    $bucketProfiles=@{}
+    $bucketMapPath=Join-Path (Split-Path $ManagedJobsPath -Parent) "s3-buckets.json"
+    if(Test-Path $bucketMapPath){
+        try{
+            $bucketMap=Get-Content $bucketMapPath -Raw -Encoding UTF8|ConvertFrom-Json
+            foreach($profileProperty in $bucketMap.PSObject.Properties){
+                foreach($bucketName in @($profileProperty.Value)){
+                    $bucketKey=[string]$bucketName
+                    if(-not[string]::IsNullOrWhiteSpace($bucketKey)){
+                        if(-not$bucketProfiles.ContainsKey($bucketKey)){$bucketProfiles[$bucketKey]=@()}
+                        $bucketProfiles[$bucketKey]=@($bucketProfiles[$bucketKey])+[string]$profileProperty.Name
+                    }
+                }
+            }
+        }catch{}
+    }
 
     foreach($job in @($byName.Values)){
         $copy=[ordered]@{}
@@ -508,6 +537,14 @@ function Get-EffectiveJobs {
             $ov=$overrides[$name]
             foreach($p in $ov.PSObject.Properties){
                 if($p.Name -ne "Name"){ $copy[$p.Name]=$p.Value }
+            }
+        }
+
+        if([string]::IsNullOrWhiteSpace([string]$copy["AwsProfile"])){
+            $bucket=[string]$copy["Bucket"]
+            if($bucketProfiles.ContainsKey($bucket)){
+                $matches=@($bucketProfiles[$bucket]|Select-Object -Unique)
+                if($matches.Count -eq 1){$copy["AwsProfile"]=[string]$matches[0]}
             }
         }
 

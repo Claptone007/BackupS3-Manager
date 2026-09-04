@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.11";
+    private const string CurrentVersion = "24.12";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -362,7 +362,11 @@ internal sealed class ApiBridge
 
         var result = new JsonArray();
         foreach (var j in jobs.Values.OrderBy(x => x["Name"]?.GetValue<string>(), StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(j["AwsProfile"]?.ToString()))
+                j["AwsProfile"] = EffectiveAwsProfile(j);
             result.Add(j);
+        }
         return result;
     }
 
@@ -1596,8 +1600,22 @@ internal sealed class ApiBridge
 
     private static string EffectiveAwsProfile(JsonObject job)
     {
-        var configured = job["AwsProfile"]?.ToString();
-        return SafeProfileName(string.IsNullOrWhiteSpace(configured) ? "default" : configured);
+        var configured = job["AwsProfile"]?.ToString()?.Trim();
+        if (!string.IsNullOrWhiteSpace(configured)) return SafeProfileName(configured);
+
+        var bucket = job["Bucket"]?.ToString()?.Trim() ?? "";
+        if (bucket.Length > 0)
+        {
+            var bucketMap = ReadObject(S3BucketsPath, new JsonObject());
+            var matches = bucketMap
+                .Where(pair => pair.Value is JsonArray values && values.Any(value =>
+                    string.Equals(value?.ToString(), bucket, StringComparison.OrdinalIgnoreCase)))
+                .Select(pair => pair.Key)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (matches.Length == 1) return SafeProfileName(matches[0]);
+        }
+        return "default";
     }
 
     private async Task<string> ResolveS3EndpointAsync(string profile)
@@ -1629,6 +1647,8 @@ internal sealed class ApiBridge
         // to jobs imported from BackupJobs.psd1.
         j["Name"] = name;
         j["Enabled"] = true;
+        if (string.IsNullOrWhiteSpace(j["AwsProfile"]?.ToString()))
+            j["AwsProfile"] = EffectiveAwsProfile(j);
 
         var m = ReadObject(AppPaths.ManagedJobsPath, new JsonObject {
             ["AddedJobs"] = new JsonArray(),
@@ -2003,10 +2023,9 @@ internal sealed class ApiBridge
             !key.StartsWith(allowedPrefix, StringComparison.Ordinal))
             return ApiResponse.Json(400, new { error = "S3 key is outside the selected database prefix" });
 
-        var cfg = await ConfigAsync();
-        var args = new List<string> {"--endpoint-url", cfg["Global"]?["EndpointUrl"]?.ToString() ?? ""};
-        var profile = j["AwsProfile"]?.ToString() ?? "";
-        if (profile.Length > 0) args.AddRange(new[]{"--profile",profile});
+        var profile = EffectiveAwsProfile(j);
+        var endpoint = await ResolveS3EndpointAsync(profile);
+        var args = new List<string> {"--endpoint-url", endpoint, "--profile", profile};
         args.AddRange(new[]{"s3api","delete-object","--bucket",j["Bucket"]?.ToString() ?? "","--key",key});
         var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
         if (r.ExitCode != 0) return ApiResponse.Json(500, new { error = r.Output });
@@ -2112,8 +2131,6 @@ internal sealed class ApiBridge
 
     private async Task<ApiResponse> S3ConnectionsAsync()
     {
-        var cfg = await ConfigAsync();
-        var endpoint = cfg["Global"]?["EndpointUrl"]?.ToString() ?? "";
         var jobs = await EffectiveJobsAsync();
 
         var unique = new Dictionary<string, (string Bucket, string Profile)>(StringComparer.OrdinalIgnoreCase);
@@ -2122,11 +2139,29 @@ internal sealed class ApiBridge
         {
             if (n is not JsonObject j) continue;
             var bucket = j["Bucket"]?.ToString()?.Trim() ?? "";
-            var profile = j["AwsProfile"]?.ToString()?.Trim() ?? "";
+            var profile = EffectiveAwsProfile(j);
             if (bucket.Length == 0) continue;
 
             var key = bucket + "\u001f" + profile;
             unique.TryAdd(key, (bucket, profile));
+        }
+
+        // The header represents saved S3 connections, not only buckets that
+        // are already referenced by a database.
+        var savedBuckets = ReadObject(S3BucketsPath, new JsonObject());
+        var savedCredentials = ReadIni(AppPaths.AwsCredentialsPath);
+        foreach (var profile in savedCredentials.Keys)
+        {
+            var buckets = savedBuckets[profile] as JsonArray;
+            if (buckets is not null && buckets.Count > 0)
+            {
+                foreach (var node in buckets)
+                {
+                    var bucket = node?.ToString()?.Trim() ?? "";
+                    if (bucket.Length > 0) unique.TryAdd(bucket + "\u001f" + profile, (bucket, profile));
+                }
+            }
+            else unique.TryAdd("\u001f" + profile, ("", profile));
         }
 
         var result = new JsonArray();
@@ -2135,25 +2170,27 @@ internal sealed class ApiBridge
                                           .ThenBy(x => x.Profile, StringComparer.OrdinalIgnoreCase))
         {
             var args = new List<string>();
-            if (!string.IsNullOrWhiteSpace(endpoint))
+            var endpoint = "";
+            try
             {
-                args.Add("--endpoint-url");
-                args.Add(endpoint);
+                endpoint = await ResolveS3EndpointAsync(item.Profile);
             }
-
-            if (!string.IsNullOrWhiteSpace(item.Profile))
+            catch (Exception ex)
             {
-                args.Add("--profile");
-                args.Add(item.Profile);
+                result.Add(new JsonObject {
+                    ["endpoint"] = "", ["bucket"] = item.Bucket, ["profile"] = item.Profile,
+                    ["profileDisplay"] = GetS3DisplayName(item.Profile), ["ok"] = false,
+                    ["exitCode"] = -1, ["elapsedMs"] = 0, ["message"] = ex.Message
+                });
+                continue;
             }
+            args.AddRange(new[] { "--endpoint-url", endpoint, "--profile", item.Profile });
 
-            args.AddRange(new[]
-            {
-                "s3api", "list-objects-v2",
-                "--bucket", item.Bucket,
-                "--max-keys", "1",
-                "--output", "json"
-            });
+            if (item.Bucket.Length > 0)
+                args.AddRange(new[] { "s3api", "list-objects-v2", "--bucket", item.Bucket,
+                    "--max-keys", "1", "--output", "json" });
+            else
+                args.AddRange(new[] { "s3api", "list-buckets", "--output", "json" });
 
             var started = DateTime.UtcNow;
             var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
@@ -2166,9 +2203,9 @@ internal sealed class ApiBridge
             result.Add(new JsonObject
             {
                 ["endpoint"] = endpoint,
-                ["bucket"] = item.Bucket,
+                ["bucket"] = item.Bucket.Length > 0 ? item.Bucket : "Все бакеты",
                 ["profile"] = item.Profile,
-                ["profileDisplay"] = string.IsNullOrWhiteSpace(item.Profile) ? "default" : item.Profile,
+                ["profileDisplay"] = GetS3DisplayName(item.Profile),
                 ["ok"] = r.ExitCode == 0,
                 ["exitCode"] = r.ExitCode,
                 ["elapsedMs"] = elapsed,
@@ -2178,9 +2215,11 @@ internal sealed class ApiBridge
 
         var okCount = result.Count(n => n?["ok"]?.GetValue<bool>() == true);
 
+        var endpoints = result.Select(node => node?["endpoint"]?.ToString() ?? "")
+            .Where(value => value.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         return ApiResponse.JsonText(200, new JsonObject
         {
-            ["endpoint"] = endpoint,
+            ["endpoint"] = endpoints.Length == 1 ? endpoints[0] : "",
             ["total"] = result.Count,
             ["ok"] = okCount,
             ["connections"] = result,
@@ -2190,10 +2229,12 @@ internal sealed class ApiBridge
 
     private async Task<ApiResponse> S3FoldersAsync(Dictionary<string,string> q)
     {
-        var cfg = await ConfigAsync();
-        var args = new List<string>{"--endpoint-url",cfg["Global"]?["EndpointUrl"]?.ToString() ?? ""};
-        var profile = q.GetValueOrDefault("profile","");
-        if (profile.Length > 0) args.AddRange(new[]{"--profile",profile});
+        var bucket = q.GetValueOrDefault("bucket", "");
+        var profile = q.GetValueOrDefault("profile", "");
+        if (string.IsNullOrWhiteSpace(profile))
+            profile = EffectiveAwsProfile(new JsonObject { ["Bucket"] = bucket });
+        var endpoint = await ResolveS3EndpointAsync(profile);
+        var args = new List<string>{"--endpoint-url",endpoint,"--profile",profile};
         args.AddRange(new[]{"s3api","list-objects-v2","--bucket",q.GetValueOrDefault("bucket",""),
                             "--delimiter","/","--max-keys","1000","--output","json"});
         var r = await RunProcessAsync("aws", args, AppPaths.DataRoot);
@@ -2395,8 +2436,8 @@ internal sealed class ApiBridge
     {
         var j = await EffectiveJobAsync(name);
         if (j is null) return ApiResponse.Json(404, new { error = "job not found" });
-        var cfg = await ConfigAsync();
-        var endpoint = cfg["Global"]?["EndpointUrl"]?.ToString() ?? "";
+        var profile = EffectiveAwsProfile(j);
+        var endpoint = await ResolveS3EndpointAsync(profile);
         string E(string? s) => (s ?? "").Replace("\"","`\"");
         var ps = string.Join("\r\n", new[]
         {
@@ -2407,7 +2448,7 @@ internal sealed class ApiBridge
             $"$s3Path=\"{E(j["S3Path"]?.ToString())}\"",
             $"$localPath=\"{E(j["LocalPath"]?.ToString())}\"",
             $"$filePrefix=\"{E(j["FilePrefix"]?.ToString())}\"",
-            $"$profile=\"{E(j["AwsProfile"]?.ToString())}\"",
+            $"$profile=\"{E(profile)}\"",
             "$latest=Get-ChildItem $localPath -File | Where-Object {$_.Name.StartsWith($filePrefix,[StringComparison]::OrdinalIgnoreCase)} | Sort-Object LastWriteTime -Descending | Select-Object -First 1",
             "if($null-eq$latest){throw \"Backup file not found\"}",
             "$key=if($s3Path){\"$s3Path/$($latest.Name)\"}else{$latest.Name}",
@@ -2415,7 +2456,8 @@ internal sealed class ApiBridge
             "Write-Host \"Local: $($latest.FullName)\"",
             "Write-Host \"S3: $dest\"",
             "if(-not$Upload){Write-Host \"DRY RUN. Use -Upload\";exit 0}",
-            "$args=@(\"--endpoint-url\",$endpoint)",
+            "$args=@()",
+            "if($endpoint){$args+=@(\"--endpoint-url\",$endpoint)}",
             "if($profile){$args+=@(\"--profile\",$profile)}",
             "& aws @args s3 cp $latest.FullName $dest --only-show-errors",
             "if($LASTEXITCODE-ne0){throw \"AWS upload failed: $LASTEXITCODE\"}",

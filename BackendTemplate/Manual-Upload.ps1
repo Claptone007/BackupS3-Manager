@@ -101,6 +101,21 @@ function Get-Job {
             foreach($x in $p.Value.PSObject.Properties){$copy[$x.Name]=$x.Value}
         }
     }
+    if([string]::IsNullOrWhiteSpace([string]$copy["AwsProfile"])){
+        $bucketMapPath=Join-Path $stateDir "s3-buckets.json"
+        if(Test-Path $bucketMapPath){
+            try{
+                $bucket=[string]$copy["Bucket"]
+                $profiles=@()
+                $bucketMap=Get-Content $bucketMapPath -Raw -Encoding UTF8|ConvertFrom-Json
+                foreach($profileProperty in $bucketMap.PSObject.Properties){
+                    if(@($profileProperty.Value)-contains$bucket){$profiles+= [string]$profileProperty.Name}
+                }
+                $profiles=@($profiles|Select-Object -Unique)
+                if($profiles.Count -eq 1){$copy["AwsProfile"]=$profiles[0]}
+            }catch{}
+        }
+    }
     return [PSCustomObject]$copy
 }
 
@@ -288,6 +303,21 @@ function Get-RuntimeSettings {
     [PSCustomObject]@{SafeMode=$safe;EnableUpload=$upload;Endpoint=$cfg.Global.EndpointUrl}
 }
 
+function Get-AwsEndpointForProfile {
+    param([string]$Profile,[string]$Fallback)
+    $profileName=if([string]::IsNullOrWhiteSpace($Profile)){"default"}else{$Profile}
+    $awsConfig=Join-Path $env:USERPROFILE ".aws\config"
+    if(Test-Path $awsConfig -PathType Leaf){
+        $wanted=if($profileName -ieq "default"){"default"}else{"profile $profileName"}
+        $section=""
+        foreach($line in Get-Content $awsConfig -Encoding UTF8){
+            if($line -match '^\s*\[([^]]+)\]\s*$'){$section=$matches[1].Trim();continue}
+            if($section -ieq $wanted -and $line -match '^\s*endpoint_url\s*=\s*(.+?)\s*$'){return $matches[1].Trim()}
+        }
+    }
+    return $Fallback
+}
+
 $script:StartedAt=(Get-Date).ToString("o")
 if(-not(Test-Path $statusDir)){New-Item -ItemType Directory -Path $statusDir -Force|Out-Null}
 
@@ -321,7 +351,9 @@ try{
     $dest="s3://$($job.Bucket)/$key"
 
     # If object already exists with same size, do not upload it again.
-    $aws=@("--endpoint-url",[string]$runtime.Endpoint)
+    $endpoint=Get-AwsEndpointForProfile ([string]$job.AwsProfile) ([string]$runtime.Endpoint)
+    $aws=@()
+    if($endpoint -and $endpoint -notmatch 's3\.example\.com'){$aws+=@("--endpoint-url",$endpoint)}
     if(-not[string]::IsNullOrWhiteSpace([string]$job.AwsProfile)){
         $aws+=@("--profile",[string]$job.AwsProfile)
     }
