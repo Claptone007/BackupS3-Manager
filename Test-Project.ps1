@@ -46,6 +46,8 @@ foreach($f in Get-ChildItem $backend -Filter *.ps1 -File){
 
 $projectSource=Get-Content (Join-Path $root "src\BackupS3Manager.csproj") -Raw -Encoding UTF8
 $buildSource=Get-Content (Join-Path $root "Build-App.ps1") -Raw -Encoding UTF8
+$dashboardSource=Get-Content (Join-Path $root "BackendTemplate\Generate-Dashboard.ps1") -Raw -Encoding UTF8
+$appPathsSource=Get-Content (Join-Path $root "src\AppPaths.cs") -Raw -Encoding UTF8
 if($projectSource -notmatch 'BackendTemplate\\Web\\\*\*\\\*'){
     throw "Public build does not exclude generated BackendTemplate/Web files"
 }
@@ -53,6 +55,17 @@ if($buildSource -notmatch 'publishedWeb'){
     throw "Build-App.ps1 does not clean generated Dashboard files"
 }
 Write-Host "[OK] generated Dashboard is excluded from public builds" -ForegroundColor Green
+
+if($dashboardSource -match '(window\.)?location\.reload\s*\('){
+    throw "Dashboard still contains cache-prone location.reload()"
+}
+if($dashboardSource -notmatch "function reloadDashboard\(delay\)"){
+    throw "Dashboard does not provide cache-busted reload helper"
+}
+if($appPathsSource -notmatch 'GenerateDashboard\(\) => GenerateDashboard\(allowStaleOnFailure: false\)'){
+    throw "Dashboard generation is not strict for mutating API calls"
+}
+Write-Host "[OK] add/delete operations cannot silently reuse a stale Dashboard" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Project structure OK." -ForegroundColor Green

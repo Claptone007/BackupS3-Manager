@@ -3470,6 +3470,10 @@ html[data-theme="light"] #recentEventTooltip{
     window.alert=function(message){
         return showAppDialog({title:'Сообщение',message:message,kind:'error',showCancel:false,confirmText:'Понятно'});
     };
+    function reloadDashboard(delay){
+        const navigate=()=>location.replace('index.html?t='+Date.now());
+        if(Number(delay)>0)setTimeout(navigate,Number(delay));else navigate();
+    }
     appDialogConfirm.addEventListener('click',()=>finishAppDialog(true));
     appDialogCancel.addEventListener('click',()=>finishAppDialog(false));
     document.addEventListener('keydown',e=>{
@@ -3492,7 +3496,7 @@ html[data-theme="light"] #recentEventTooltip{
             const r=await fetch('/api/startup-workspace/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Mode:selected,AutoEnter:!!autoEnter})});
             if(!r.ok){let t=await r.text();try{t=JSON.parse(t).error||t}catch(_){}throw new Error(t);}
             sessionStorage.setItem('backupS3WorkspaceChosen','1');
-            location.replace('index.html?t='+Date.now());
+            reloadDashboard();
         }catch(e){startupWorkspaceError.textContent=e.message;startupWorkspaceContinue.disabled=false;startupWorkspaceContinue.textContent='Продолжить';}
     }
     startupWorkspaceContinue.addEventListener('click',async()=>{
@@ -3573,14 +3577,14 @@ html[data-theme="light"] #recentEventTooltip{
         try{
             favoritesGrid.innerHTML='<div class="favorites-empty"><strong>Закрепляю '+name+'…</strong></div>';
             await setJobPinned(name,true);
-            location.reload();
+            reloadDashboard();
         }catch(error){alert('Не удалось закрепить базу: '+error.message);}
     });
 
     document.querySelectorAll('.unpin-job').forEach(button=>{
         button.addEventListener('click',async event=>{
             event.stopPropagation();
-            try{button.disabled=true;await setJobPinned(button.dataset.job,false);location.reload();}
+            try{button.disabled=true;await setJobPinned(button.dataset.job,false);reloadDashboard();}
             catch(error){button.disabled=false;alert('Не удалось открепить базу: '+error.message);}
         });
     });
@@ -4002,7 +4006,7 @@ html[data-theme="light"] #recentEventTooltip{
         try{
             const response=await fetch('/api/jobs/delete-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Names:names})});
             if(!response.ok){let text=await response.text();try{text=JSON.parse(text).error||text}catch(_){}throw new Error(text);}
-            location.replace('index.html?t='+Date.now());
+            reloadDashboard();
         }catch(e){
             deleteSelectedButton.disabled=false;selectedButton.disabled=false;selectAllJobsButton.disabled=false;
             await showAppDialog({title:'Ошибка удаления',message:e.message,kind:'error'});
@@ -4261,7 +4265,7 @@ html[data-theme="light"] #recentEventTooltip{
                     if((sawOffline && consecutiveOk>=1) || consecutiveOk>=2){
                         serverRestartMessage.textContent='Dashboard запущен. Обновляю страницу...';
                         await new Promise(resolve=>setTimeout(resolve,350));
-                        location.reload();
+                        reloadDashboard();
                         return;
                     }
                 }else{
@@ -5035,7 +5039,7 @@ html[data-theme="light"] #recentEventTooltip{
                         if(action[1]==='load'){
                             if(!await appConfirm('Загрузить профиль «'+profile.name+'»? Текущий набор баз и настроек будет заменён.',{title:'Загрузка профиля',confirmText:'Загрузить'}))return;
                             await apiJson('/api/config-profiles/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name})});
-                            location.reload();
+                            reloadDashboard();
                         }else if(action[1]==='delete'){
                             if(!await appConfirm('Удалить сохранённый профиль «'+profile.name+'»?',{title:'Удаление профиля',confirmText:'Удалить',kind:'danger'}))return;
                             await apiJson('/api/config-profiles/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:profile.name})});
@@ -5186,10 +5190,10 @@ html[data-theme="light"] #recentEventTooltip{
             const agentId=buttons[0].dataset.agentId||'';const names=buttons.map(button=>button.dataset.job);
             if(agentId){
                 for(const name of names){const response=await fetch('/api/agents/request-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:agentId,name:name})});if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||'Агент не принял команду.')}
-                await appAlert('Команда отправлена агенту. Назначенных баз: '+names.length+'. Результаты появятся после ближайшего heartbeat.',{title:'Проверка сервера запущена'});setTimeout(()=>location.reload(),17000);
+                await appAlert('Команда отправлена агенту. Назначенных баз: '+names.length+'. Результаты появятся после ближайшего heartbeat.',{title:'Проверка сервера запущена'});reloadDashboard(17000);
             }else{
                 const response=await fetch('/api/jobs/check-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Names:names})});if(!response.ok)throw new Error(await response.text());
-                await appAlert('Локальная проверка запущена. Баз: '+names.length+'.',{title:'Проверка Manager запущена'});setTimeout(()=>location.reload(),1800);
+                await appAlert('Локальная проверка запущена. Баз: '+names.length+'.',{title:'Проверка Manager запущена'});reloadDashboard(1800);
             }
         }catch(error){await appAlert(error.message,{title:'Ошибка проверки',kind:'error'});action.disabled=false;action.textContent=oldText}
     });
@@ -5244,8 +5248,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.9');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.9';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.10');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.10';});
 
         updateSettingsDangerState();
         return s;
@@ -5741,7 +5745,7 @@ html[data-theme="light"] #recentEventTooltip{
             // AddJobAsync уже сформировал новый dashboard. Перезагрузка сразу
             // показывает новую строку и событие, а инициализация страницы
             // подхватит продолжающуюся фоновую проверку через /api/progress.
-            location.reload();
+            reloadDashboard();
             return;
         }
         catch (e) {
@@ -5956,7 +5960,7 @@ html[data-theme="light"] #recentEventTooltip{
                                 setTimeout(async()=>{
                                     await refreshEditLocal(databaseName);
                                     await refreshEditS3(databaseName);
-                                    setTimeout(()=>window.location.reload(),1200);
+                                    reloadDashboard(1200);
                                 },700);
                             }
                             else if(st.status==='ERROR'){
@@ -6469,7 +6473,7 @@ html[data-theme="light"] #recentEventTooltip{
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({Name:payload.Name})
         });
-        setTimeout(()=>location.reload(),1800);
+        reloadDashboard(1800);
     });
 
     // v16: maintenance mode.
@@ -6483,7 +6487,7 @@ html[data-theme="light"] #recentEventTooltip{
             const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
             if(!r.ok){alert(await r.text());return;}
             await fetch('/api/jobs/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:name})});
-            setTimeout(()=>location.reload(),1800);
+            reloadDashboard(1800);
         });
     });
 
@@ -6519,7 +6523,7 @@ html[data-theme="light"] #recentEventTooltip{
         if(!retentionJob || !await appConfirm('Удалить показанные старые объекты S3?',{title:'Применить retention',confirmText:'Удалить',kind:'danger'}))return;
         const r=await fetch('/api/retention/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:retentionJob})});
         if(!r.ok){alert(await r.text());return;}
-        closeRetention();await fetch('/api/jobs/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:retentionJob})});setTimeout(()=>location.reload(),1800);
+        closeRetention();await fetch('/api/jobs/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Name:retentionJob})});reloadDashboard(1800);
     });
 
     // v15: проверка только выбранной базы.
@@ -6539,7 +6543,7 @@ html[data-theme="light"] #recentEventTooltip{
                     const remote=await fetch('/api/agents/request-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:agentId,name:name})});
                     const remoteResult=await remote.json().catch(()=>({}));if(!remote.ok)throw new Error(remoteResult.error||'Агент не принял команду проверки.');
                     await appAlert('Команда отправлена агенту. Проверка локальной папки пройдёт на назначенном сервере, результат появится после ближайшего heartbeat.',{title:'Удалённая проверка запущена'});
-                    setTimeout(()=>location.reload(),17000);return;
+                    reloadDashboard(17000);return;
                 }
                 const response = await fetch('/api/jobs/check', {
                     method: 'POST',
@@ -6597,7 +6601,7 @@ html[data-theme="light"] #recentEventTooltip{
                     throw new Error(await response.text());
                 }
 
-                location.replace('index.html?t='+Date.now());
+                reloadDashboard();
             }
             catch (e) {
                 button.disabled = false;

@@ -63,7 +63,10 @@ internal static class AppPaths
 
         SyncTemplateFiles();
         CreateDailyConfigurationSnapshot();
-        GenerateDashboard();
+        // At startup the last valid dashboard is still useful for diagnostics.
+        // Mutating API calls use the strict default below, so they can never
+        // report success while leaving an obsolete page on screen.
+        GenerateDashboard(allowStaleOnFailure: true);
     }
 
     private static void CreateDailyConfigurationSnapshot()
@@ -117,7 +120,9 @@ internal static class AppPaths
         }
     }
 
-    public static void GenerateDashboard()
+    public static void GenerateDashboard() => GenerateDashboard(allowStaleOnFailure: false);
+
+    public static void GenerateDashboard(bool allowStaleOnFailure)
     {
         if (!File.Exists(GenerateDashboardScript) || !File.Exists(ConfigPath))
             return;
@@ -158,7 +163,7 @@ internal static class AppPaths
         {
             var details = (stderrTask.GetAwaiter().GetResult() + Environment.NewLine + stdoutTask.GetAwaiter().GetResult()).Trim();
             AppLog.Error($"Generate-Dashboard.ps1 завершился с кодом {p.ExitCode}. {details}");
-            if (File.Exists(index))
+            if (allowStaleOnFailure && File.Exists(index))
             {
                 AppLog.Warn("Используется последний успешно созданный Dashboard.");
                 return;

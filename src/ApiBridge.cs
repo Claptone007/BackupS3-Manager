@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.9";
+    private const string CurrentVersion = "24.10";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1639,6 +1639,8 @@ internal sealed class ApiBridge
         a.Add(j);
         m["AddedJobs"] = a;
         WriteObjectAtomic(AppPaths.ManagedJobsPath, m);
+        if (await EffectiveJobAsync(name) is null)
+            throw new InvalidOperationException("База записана, но не появилась в итоговой конфигурации.");
         AppendHistoryEvent("JOB_ADDED", name, "База добавлена в Backup S3 Manager");
         AppPaths.GenerateDashboard();
         return ApiResponse.Json(200, new { status = "added", name });
@@ -1772,6 +1774,8 @@ internal sealed class ApiBridge
         if (m["Overrides"] is JsonObject overrides) overrides.Remove(name);
 
         WriteObjectAtomic(AppPaths.ManagedJobsPath, m);
+        if (await EffectiveJobAsync(name) is not null)
+            throw new InvalidOperationException("База не была удалена из итоговой конфигурации.");
         AppendHistoryEvent("JOB_DELETED", name, "База удалена из Backup S3 Manager");
         AppPaths.GenerateDashboard();
         return ApiResponse.Json(200, new { status = "deleted" });
@@ -1811,6 +1815,12 @@ internal sealed class ApiBridge
             foreach (var name in names) overrides.Remove(name);
 
         WriteObjectAtomic(AppPaths.ManagedJobsPath, managed);
+        var remaining = new HashSet<string>(
+            (await EffectiveJobsAsync()).OfType<JsonObject>().Select(job => job["Name"]?.ToString() ?? ""),
+            StringComparer.OrdinalIgnoreCase);
+        var failed = names.Where(remaining.Contains).ToArray();
+        if (failed.Length > 0)
+            throw new InvalidOperationException("Не удалось удалить базы: " + string.Join(", ", failed));
         foreach (var name in names)
             AppendHistoryEvent("JOB_DELETED", name, "База удалена из Backup S3 Manager");
         AppPaths.GenerateDashboard();
