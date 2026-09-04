@@ -98,6 +98,18 @@ function Convert-JobToOrderedMap {
     return $map
 }
 
+function Set-ObjectProperty {
+    param(
+        [Parameter(Mandatory=$true)]$Object,
+        [Parameter(Mandatory=$true)][string]$Name,
+        $Value
+    )
+
+    # Старые state.json могут не содержать полей, добавленных в новых версиях.
+    # Add-Member -Force одинаково безопасно обновляет и создаёт свойство.
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
 function Get-EffectiveDashboardJobs {
     param(
         $BaseJobs,
@@ -247,13 +259,13 @@ foreach($configured in $effectiveJobs){
 
         # Configuration wins for fields which can be edited without waiting
         # for another check.
-        $row.LocalPath=[string]$configured.LocalPath
-        $row.Bucket=[string]$configured.Bucket
-        $row.S3Path=[string]$configured.S3Path
-        $row.AwsProfile=[string]$configured.AwsProfile
-        $row.Keep=[int]$configured.Keep
-        $row.ExpectedBackupTime=[string]$configured.ExpectedBackupTime
-        $row.ExpectedDays=[string]$configured.ExpectedDays
+        Set-ObjectProperty $row "LocalPath" ([string]$configured.LocalPath)
+        Set-ObjectProperty $row "Bucket" ([string]$configured.Bucket)
+        Set-ObjectProperty $row "S3Path" ([string]$configured.S3Path)
+        Set-ObjectProperty $row "AwsProfile" ([string]$configured.AwsProfile)
+        Set-ObjectProperty $row "Keep" ([int]$configured.Keep)
+        Set-ObjectProperty $row "ExpectedBackupTime" ([string]$configured.ExpectedBackupTime)
+        Set-ObjectProperty $row "ExpectedDays" ([string]$configured.ExpectedDays)
 
         $jobs+=$row
     }else{
@@ -5248,8 +5260,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.10');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.10';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.11');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.11';});
 
         updateSettingsDangerState();
         return s;

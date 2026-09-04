@@ -21,6 +21,7 @@ $required=@(
     "Test-BuildEnvironment.ps1",
     "Test-CSharpSource.ps1",
     "Test-DesktopApiBridge.ps1",
+    "Test-DashboardStateCompatibility.ps1",
     "Test-v23.11-Scheduler.ps1",
     "Test-v23.12-SelfDiagnostics.ps1",
     "Test-v23.12-ProfilesAndAutomation.ps1",
