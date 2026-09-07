@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.16";
+    private const string CurrentVersion = "24.17";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1066,6 +1066,17 @@ internal sealed class ApiBridge
     {
         var o = ParseBody(body);
         var name = o["Name"]?.ToString() ?? "";
+        if (name.Length > 0)
+        {
+            var job = await EffectiveJobAsync(name);
+            if (job is null) return ApiResponse.Json(404, new { error = "База не найдена." });
+            var agentId = (job["AgentId"]?.ToString() ?? "").Trim();
+            if (agentId.Length > 0)
+                return RequestAgentCheck(new JsonObject {
+                    ["agentId"] = agentId,
+                    ["name"] = name
+                }.ToJsonString());
+        }
         return await StartControllerAsync(name.Length > 0 ? new[]{ name } : Array.Empty<string>());
     }
 
@@ -1676,7 +1687,8 @@ internal sealed class ApiBridge
             throw new InvalidOperationException("База записана, но не появилась в итоговой конфигурации.");
         AppendHistoryEvent("JOB_ADDED", name, "База добавлена в Backup S3 Manager");
         AppPaths.GenerateDashboard();
-        return ApiResponse.Json(200, new { status = "added", name });
+        var total = (await EffectiveJobsAsync()).Count;
+        return ApiResponse.Json(200, new { status = "added", name, agentId, total });
     }
 
     private async Task<ApiResponse> UpdateJobAsync(string body)

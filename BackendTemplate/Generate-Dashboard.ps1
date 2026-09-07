@@ -193,6 +193,7 @@ function New-UncheckedDashboardState {
 
     return [PSCustomObject][ordered]@{
         Name=[string]$Job.Name
+        AgentId=[string]$Job.AgentId
         Status="WAITING"
         StatusText="База добавлена, проверка ещё не выполнялась"
         ReasonCodes=@("NOT_CHECKED")
@@ -273,6 +274,7 @@ foreach($configured in $effectiveJobs){
 
         # Configuration wins for fields which can be edited without waiting
         # for another check.
+        Set-ObjectProperty $row "AgentId" ([string]$configured.AgentId)
         Set-ObjectProperty $row "LocalPath" ([string]$configured.LocalPath)
         Set-ObjectProperty $row "Bucket" ([string]$configured.Bucket)
         Set-ObjectProperty $row "S3Path" ([string]$configured.S3Path)
@@ -5286,8 +5288,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.16');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.16';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.17');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.17';});
 
         updateSettingsDangerState();
         return s;

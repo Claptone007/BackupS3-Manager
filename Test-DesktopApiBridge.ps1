@@ -1,7 +1,7 @@
 $ErrorActionPreference="Stop"
 $root=Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Host "=== BackupS3 Manager v24.16 API bridge source check ===" -ForegroundColor Cyan
+Write-Host "=== BackupS3 Manager v24.17 API bridge source check ===" -ForegroundColor Cyan
 
 $main=Get-Content (Join-Path $root "src\MainForm.cs") -Raw -Encoding UTF8
 $api=Get-Content (Join-Path $root "src\ApiBridge.cs") -Raw -Encoding UTF8
@@ -26,10 +26,21 @@ if($main -match 'AddWebResourceRequestedFilter\s*\('){
 }
 Write-Host "[OK] old network-style API transport removed" -ForegroundColor Green
 
-if($api -notmatch 'CurrentVersion\s*=\s*"24\.16"'){
-    throw "ApiBridge.cs version is not 24.16"
+if($api -notmatch 'CurrentVersion\s*=\s*"24\.17"'){
+    throw "ApiBridge.cs version is not 24.17"
 }
-Write-Host "[OK] desktop API version 24.16" -ForegroundColor Green
+Write-Host "[OK] desktop API version 24.17" -ForegroundColor Green
+
+foreach($needle in @('return RequestAgentCheck','["AgentId"] = agentId','total = (await EffectiveJobsAsync()).Count')){
+    if(-not$api.Contains($needle)){throw "ApiBridge.cs missing agent job synchronization: $needle"}
+    Write-Host "[OK] agent job synchronization: $needle" -ForegroundColor Green
+}
+
+$hub=Get-Content (Join-Path $root "src\AgentHubServer.cs") -Raw -Encoding UTF8
+foreach($needle in @('reportChanged','AppPaths.GenerateDashboard()')){
+    if(-not$hub.Contains($needle)){throw "AgentHubServer.cs missing dashboard refresh: $needle"}
+    Write-Host "[OK] heartbeat dashboard refresh: $needle" -ForegroundColor Green
+}
 
 foreach($needle in @(
     '"-RootPath",AppPaths.DataRoot',

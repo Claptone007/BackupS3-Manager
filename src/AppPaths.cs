@@ -4,6 +4,7 @@ namespace BackupS3Manager;
 
 internal static class AppPaths
 {
+    private static readonly object DashboardGenerationLock = new();
     public static string InstallRoot => AppContext.BaseDirectory;
     public static string TemplateRoot => Path.Combine(InstallRoot, "BackendTemplate");
     public static string BundledWebView2Runtime => Path.Combine(InstallRoot, "WebView2Runtime");
@@ -123,6 +124,12 @@ internal static class AppPaths
     public static void GenerateDashboard() => GenerateDashboard(allowStaleOnFailure: false);
 
     public static void GenerateDashboard(bool allowStaleOnFailure)
+    {
+        lock (DashboardGenerationLock)
+            GenerateDashboardCore(allowStaleOnFailure);
+    }
+
+    private static void GenerateDashboardCore(bool allowStaleOnFailure)
     {
         if (!File.Exists(GenerateDashboardScript) || !File.Exists(ConfigPath))
             return;

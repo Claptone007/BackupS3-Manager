@@ -186,6 +186,8 @@ internal sealed class AgentHubServer : IDisposable
         if (token.Length == 0) return new(401, new JsonObject { ["error"] = "Токен агента не передан." });
         var agentId = body["agentId"]?.ToString() ?? "";
 
+        var reportChanged = false;
+        HubResponse response;
         lock (StateLock)
         {
             var state = ReadAgentState();
@@ -200,6 +202,9 @@ internal sealed class AgentHubServer : IDisposable
             agent["version"] = body["version"]?.ToString() ?? "unknown";
             agent["lastSeen"] = DateTimeOffset.Now;
             agent["online"] = true;
+            var previousReport = agent["report"]?.ToJsonString() ?? "";
+            var incomingReport = body["report"]?.ToJsonString() ?? "";
+            reportChanged = !string.Equals(previousReport, incomingReport, StringComparison.Ordinal);
             agent["report"] = body["report"]?.DeepClone();
             if (body["commandResults"] is JsonArray commandResults)
             {
@@ -222,8 +227,11 @@ internal sealed class AgentHubServer : IDisposable
             agent.Remove("pendingCommands");
             agent.Remove("forceCheckJob");agent.Remove("forceCheckRequestedAt");
             WriteAgentState(state);
-            return new(200, new JsonObject { ["ok"] = true, ["serverTime"] = DateTimeOffset.Now, ["assignments"] = assignments, ["forceCheckJob"] = forceJob, ["commands"] = commands });
+            response = new(200, new JsonObject { ["ok"] = true, ["serverTime"] = DateTimeOffset.Now, ["assignments"] = assignments, ["forceCheckJob"] = forceJob, ["commands"] = commands });
         }
+        if (reportChanged)
+            _ = Task.Run(() => { try { AppPaths.GenerateDashboard(); } catch (Exception ex) { AppLog.Warn("Agent Hub: не удалось обновить Dashboard после отчёта агента: " + ex.Message); } });
+        return response;
     }
 
     private static string NormalizeHost(string? host) => (host ?? "").Trim().ToUpperInvariant();

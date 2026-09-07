@@ -23,7 +23,7 @@ try{
         Name='NewBase';Status='WAITING';LocalPath='D:\Backups\NewBase';Bucket='bucket';S3Path='folder';Keep=2
     })}|ConvertTo-Json -Depth 20|Set-Content -LiteralPath $statePath -Encoding UTF8
     @{UseBaseJobs=$false;DeletedNames=@();Overrides=@{};AddedJobs=@(@{
-        Name='NewBase';Enabled=$true;LocalPath='D:\Backups\NewBase';Bucket='bucket';S3Path='folder';Keep=2
+        Name='NewBase';AgentId='agent-test';Enabled=$true;LocalPath='D:\Backups\NewBase';Bucket='bucket';S3Path='folder';Keep=2
     })}|ConvertTo-Json -Depth 20|Set-Content -LiteralPath $managedPath -Encoding UTF8
 
     & (Join-Path $root "BackendTemplate\Generate-Dashboard.ps1") -ConfigPath $configPath
@@ -32,7 +32,9 @@ try{
     }
     $html=Get-Content $dashboardPath -Raw -Encoding UTF8
     if($html -notmatch 'NewBase'){throw "Added database is missing from Dashboard"}
+    if($html -notmatch 'data-agent-id="agent-test"'){throw "Agent assignment is missing from the new Dashboard row"}
     Write-Host "[OK] old state without AwsProfile is upgraded while Dashboard is generated" -ForegroundColor Green
+    Write-Host "[OK] newly added agent database is present in Dashboard with AgentId" -ForegroundColor Green
 }
 finally{
     if(Test-Path $testRoot){Remove-Item -LiteralPath $testRoot -Recurse -Force}
