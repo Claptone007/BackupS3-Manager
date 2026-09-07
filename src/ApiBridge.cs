@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.14";
+    private const string CurrentVersion = "24.15";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -443,6 +443,8 @@ internal sealed class ApiBridge
         if (address.Length is < 1 or > 255 || Uri.CheckHostName(address) == UriHostNameType.Unknown)
             throw new InvalidOperationException("Укажите корректный IP-адрес или имя сервера.");
         if (port is < 1024 or > 65535) throw new InvalidOperationException("Порт должен быть от 1024 до 65535.");
+        if (FindAgentTemplate() is null)
+            throw new FileNotFoundException("Компонент создания агентов отсутствует в этой сборке Manager. Установите актуальную версию BackupS3.");
         var state = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["schemaVersion"] = 2, ["agents"] = new JsonArray() });
         var code = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(6));
         state["agents"]!.AsArray().Add(new JsonObject
@@ -467,11 +469,7 @@ internal sealed class ApiBridge
         if (code.Length < 8) throw new InvalidOperationException("Код подключения агента не передан.");
         if (!Uri.TryCreate(managerUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
             throw new InvalidOperationException("Не удалось определить доступный адрес Manager.");
-        var source = new[]
-        {
-            Path.Combine(AppPaths.InstallRoot, "Agent", "BackupS3Agent.exe"),
-            Path.Combine(AppPaths.InstallRoot, "BackupS3Agent.exe")
-        }.FirstOrDefault(File.Exists);
+        var source = FindAgentTemplate();
         if (source is null) throw new FileNotFoundException("Шаблон BackupS3Agent.exe не включён в сборку Manager.");
         var configuration = new JsonObject
         {
@@ -489,6 +487,12 @@ internal sealed class ApiBridge
         return new ApiResponse(200, "OK", output.ToArray(), "application/octet-stream",
             $"Content-Disposition: attachment; filename=BackupS3Agent-{safeName}.exe\r\n");
     }
+
+    private static string? FindAgentTemplate() => new[]
+    {
+        Path.Combine(AppPaths.InstallRoot, "Agent", "BackupS3Agent.exe"),
+        Path.Combine(AppPaths.InstallRoot, "BackupS3Agent.exe")
+    }.FirstOrDefault(File.Exists);
 
     private static ApiResponse DeleteAgent(string body)
     {

@@ -1,7 +1,7 @@
 $ErrorActionPreference="Stop"
 $root=Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Host "=== BackupS3 Manager v24.14 API bridge source check ===" -ForegroundColor Cyan
+Write-Host "=== BackupS3 Manager v24.15 API bridge source check ===" -ForegroundColor Cyan
 
 $main=Get-Content (Join-Path $root "src\MainForm.cs") -Raw -Encoding UTF8
 $api=Get-Content (Join-Path $root "src\ApiBridge.cs") -Raw -Encoding UTF8
@@ -26,10 +26,10 @@ if($main -match 'AddWebResourceRequestedFilter\s*\('){
 }
 Write-Host "[OK] old network-style API transport removed" -ForegroundColor Green
 
-if($api -notmatch 'CurrentVersion\s*=\s*"24\.14"'){
-    throw "ApiBridge.cs version is not 24.14"
+if($api -notmatch 'CurrentVersion\s*=\s*"24\.15"'){
+    throw "ApiBridge.cs version is not 24.15"
 }
-Write-Host "[OK] desktop API version 24.14" -ForegroundColor Green
+Write-Host "[OK] desktop API version 24.15" -ForegroundColor Green
 
 foreach($needle in @(
     '"-RootPath",AppPaths.DataRoot',

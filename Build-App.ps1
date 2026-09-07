@@ -7,6 +7,7 @@ $here=Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here "tools\DotNet-Helpers.ps1")
 
 $proj=Join-Path $here "src\BackupS3Manager.csproj"
+$agentProj=Join-Path $here "agent\BackupS3Agent.csproj"
 $out=Join-Path $here "dist\app"
 
 $dotnetInfo = Assert-DotNet8Sdk
@@ -29,6 +30,30 @@ if($LASTEXITCODE-ne0){throw "dotnet restore failed"}
     -o $out
 
 if($LASTEXITCODE-ne0){throw "dotnet publish failed"}
+
+# Manager creates a personalized one-file agent by appending its connection
+# configuration to this clean template.
+$agentOut=Join-Path $out "Agent"
+New-Item -ItemType Directory -Path $agentOut -Force|Out-Null
+& $dotnet restore $agentProj
+if($LASTEXITCODE-ne0){throw "agent dotnet restore failed"}
+& $dotnet publish $agentProj `
+    -c $Configuration `
+    -r win-x64 `
+    --self-contained true `
+    -p:PublishSingleFile=true `
+    -p:DebugType=None `
+    -p:DebugSymbols=false `
+    -o $agentOut
+if($LASTEXITCODE-ne0){throw "agent dotnet publish failed"}
+
+$agentExe=Join-Path $agentOut "BackupS3Agent.exe"
+if(-not(Test-Path -LiteralPath $agentExe -PathType Leaf)){
+    throw "Сборка завершилась без шаблона BackupS3Agent.exe"
+}
+Get-ChildItem -LiteralPath $agentOut -File |
+    Where-Object {$_.Name -ne "BackupS3Agent.exe"} |
+    Remove-Item -Force
 
 # В публичную сборку никогда не помещаем рабочую конфигурацию разработчика.
 # Новый пользователь начинает с пустого списка баз и безопасных настроек.
@@ -65,5 +90,6 @@ if(-not(Test-Path $exe -PathType Leaf)){
 Write-Host ""
 Write-Host "OK: application built" -ForegroundColor Green
 Write-Host "EXE: $exe" -ForegroundColor Green
+Write-Host "Agent template: $agentExe" -ForegroundColor Green
 Write-Host ""
 Write-Host "Это self-contained build: на целевой машине отдельный .NET Runtime/SDK не требуется." -ForegroundColor Cyan
