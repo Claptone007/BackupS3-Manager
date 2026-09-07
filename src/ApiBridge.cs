@@ -39,7 +39,7 @@ internal sealed record ApiResponse(
 
 internal sealed class ApiBridge
 {
-    private const string CurrentVersion = "24.15";
+    private const string CurrentVersion = "24.16";
     private const string DefaultUpdateManifestUrl = "https://github.com/Claptone007/BackupS3-Manager/releases/latest/download/manifest.json";
     private static readonly HttpClient UpdateHttp = new() { Timeout = TimeSpan.FromSeconds(25) };
     private static readonly HttpClient UpdateDownloadHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
@@ -1653,6 +1653,14 @@ internal sealed class ApiBridge
         j["Enabled"] = true;
         if (string.IsNullOrWhiteSpace(j["AwsProfile"]?.ToString()))
             j["AwsProfile"] = EffectiveAwsProfile(j);
+        var agentId = (j["AgentId"]?.ToString() ?? "").Trim();
+        if (agentId.Length > 0)
+        {
+            var agentState = ReadObject(AppPaths.AgentStatePath, new JsonObject { ["agents"] = new JsonArray() });
+            if (!(agentState["agents"]?.AsArray().OfType<JsonObject>() ?? Enumerable.Empty<JsonObject>())
+                .Any(agent => string.Equals(agent["id"]?.ToString(), agentId, StringComparison.Ordinal)))
+                return ApiResponse.Json(404, new { error = "Выбранный агент не найден. Обновите список агентов." });
+        }
 
         var m = ReadObject(AppPaths.ManagedJobsPath, new JsonObject {
             ["AddedJobs"] = new JsonArray(),
@@ -1663,6 +1671,7 @@ internal sealed class ApiBridge
         a.Add(j);
         m["AddedJobs"] = a;
         WriteObjectAtomic(AppPaths.ManagedJobsPath, m);
+        AssignJobToAgent(name, agentId, j["LocalPath"]?.ToString() ?? "");
         if (await EffectiveJobAsync(name) is null)
             throw new InvalidOperationException("База записана, но не появилась в итоговой конфигурации.");
         AppendHistoryEvent("JOB_ADDED", name, "База добавлена в Backup S3 Manager");

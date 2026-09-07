@@ -2683,7 +2683,7 @@ html[data-theme="light"] #recentEventTooltip{
                 <div class="agent-assignment-field">
                     <label>
                         <span>Сервер проверки <i class="field-help" data-help="Локально — проверка выполняется Manager. При выборе агента локальная папка проверяется на указанном удалённом сервере, в том числе автоматически.">?</i></span>
-                        <select id="editAgentId"><option value="">Этот компьютер (Manager)</option></select>
+                        <select id="jobAgentId"><option value="">Этот компьютер (Manager)</option></select>
                         <small class="field-hint">Выберите Manager для локальной папки или подключённый агент для папки на удалённом сервере.</small>
                     </label>
                 </div>
@@ -2845,6 +2845,14 @@ html[data-theme="light"] #recentEventTooltip{
 
             <form id="editJobForm">
                 <input id="editJobName" type="hidden">
+
+                <div class="agent-assignment-field">
+                    <label>
+                        <span>Сервер проверки <i class="field-help" data-help="Выберите Manager для локальной папки или подключённый агент для папки на удалённом сервере.">?</i></span>
+                        <select id="editAgentId"><option value="">Этот компьютер (Manager)</option></select>
+                        <small class="field-hint">Проверка локальной папки и автоматические операции выполняются на выбранном сервере.</small>
+                    </label>
+                </div>
 
                 <div class="edit-info-strip">
                     <div><span>Последняя локальная копия</span><strong id="editLocalFile">-</strong></div>
@@ -5278,8 +5286,8 @@ html[data-theme="light"] #recentEventTooltip{
         settingUpdateManifestUrl.value=s.UpdateManifestUrl||'';
         try{const uiResponse=await fetch('/api/ui-settings?t='+Date.now(),{cache:'no-store'});const ui=uiResponse.ok?await uiResponse.json():{};const viewMode=ui.DatabaseViewMode||localStorage.getItem('backupS3DatabaseView')||'compact';const radio=databaseViewOptions.querySelector('input[value="'+viewMode+'"]')||databaseViewOptions.querySelector('input[value="compact"]');radio.checked=true;applyDatabaseView(radio.value)}catch(_){databaseViewOptions.querySelector('input[value="compact"]').checked=true;applyDatabaseView('compact')}
         fetch('/api/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(v=>{
-            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.15');
-        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.15';});
+            document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v'+(v.version||'24.16');
+        }).catch(()=>{document.getElementById('settingsCurrentVersion').textContent='BackupS3 Manager v24.16';});
 
         updateSettingsDangerState();
         return s;
@@ -5674,9 +5682,29 @@ html[data-theme="light"] #recentEventTooltip{
     const jobFilePrefix = document.getElementById('jobFilePrefix');
     const jobFormError = document.getElementById('jobFormError');
 
+    async function populateJobAgentSelect(selectId,selectedId){
+        const select=document.getElementById(selectId);
+        if(!select)return;
+        select.innerHTML='<option value="">Этот компьютер (Manager)</option>';
+        const response=await fetch('/api/agents?t='+Date.now(),{cache:'no-store'});
+        if(!response.ok)throw new Error('Не удалось получить список подключённых агентов.');
+        const data=await response.json();
+        (data.agents||[]).forEach(agent=>{
+            if(!agent.id)return;
+            const option=document.createElement('option');
+            option.value=agent.id;
+            const title=agent.displayName||agent.host||'Агент';
+            const host=agent.host&&agent.host!==title?' · '+agent.host:'';
+            option.textContent=title+host+(agent.online?' · подключён':' · нет связи');
+            select.appendChild(option);
+        });
+        select.value=selectedId||'';
+    }
+
     async function openJobModal() {
         jobModal.hidden = false;
         document.body.classList.add('modal-open');
+        try{await populateJobAgentSelect('jobAgentId','');}catch(error){jobFormError.textContent=error.message;}
         try{await refreshS3ProfileCatalog();if(!jobAwsProfileInput.value&&s3ProfileCatalog.length===1)jobAwsProfileInput.value=s3ProfileCatalog[0].name||'';fillBucketOptions('jobBucketOptions',jobAwsProfileInput.value,jobBucketInput);}catch(_){}
         jobName.focus();
     }
@@ -5715,6 +5743,7 @@ html[data-theme="light"] #recentEventTooltip{
 
         const payload = {
             Name: document.getElementById('jobName').value.trim(),
+            AgentId: document.getElementById('jobAgentId').value,
             LocalPath: document.getElementById('jobLocalPath').value.trim(),
             Bucket: document.getElementById('jobBucket').value.trim(),
             S3Path: document.getElementById('jobS3Path').value.trim(),
@@ -6349,9 +6378,7 @@ html[data-theme="light"] #recentEventTooltip{
         document.getElementById('editJobTitle').textContent=d.Name;
         document.getElementById('editJobName').value=d.Name;
         document.getElementById('editLocalPath').value=d.LocalPath||'';
-        const agentSelect=document.getElementById('editAgentId');agentSelect.innerHTML='<option value="">Этот компьютер (Manager)</option>';
-        try{const ar=await fetch('/api/agents?t='+Date.now(),{cache:'no-store'});if(ar.ok){const ad=await ar.json();(ad.agents||[]).forEach(agent=>{if(!agent.host)return;const option=document.createElement('option');option.value=agent.id;option.textContent=(agent.displayName||agent.host)+' · '+agent.host+(agent.online?' · подключён':' · нет связи');agentSelect.appendChild(option)})}}catch(_){}
-        agentSelect.value=d.AgentId||'';
+        await populateJobAgentSelect('editAgentId',d.AgentId||'');
         document.getElementById('editBucket').value=d.Bucket||'pw1';
         document.getElementById('editS3Path').value=d.S3Path||'';
         document.getElementById('editFilePrefix').value=d.FilePrefix||'';
