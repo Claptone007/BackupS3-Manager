@@ -601,10 +601,54 @@ try{
         )
     }
 
+    # Manual upload is a complete backup operation too. Apply the same
+    # count-based retention policy as BackupS3.ps1 immediately after a
+    # successful and verified upload. Previously cleanup only ran during a
+    # full check, so manual uploads could leave more objects than Keep.
+    $deletedByRetention=0
+    if([bool]$runtime.EnableCleanup){
+        $keep=[Math]::Max(1,[int]$job.Keep)
+        $objectPrefix=if($s3Root){"$s3Root/$([string]$job.FilePrefix)"}else{[string]$job.FilePrefix}
+        $inventoryArgs=$aws+@(
+            "s3api","list-objects-v2",
+            "--bucket",[string]$job.Bucket,
+            "--prefix",$objectPrefix,
+            "--output","json"
+        )
+        $inventoryResult=Invoke-AwsNative -Arguments $inventoryArgs
+        if($inventoryResult.ExitCode -ne 0){
+            throw "Файл загружен, но не удалось проверить лимит хранения S3: $($inventoryResult.Output)"
+        }
+
+        $inventory=$inventoryResult.StdOut|ConvertFrom-Json
+        $objects=@($inventory.Contents|Sort-Object {[datetime]$_.LastModified} -Descending)
+        $obsolete=@($objects|Select-Object -Skip $keep)
+        foreach($oldObject in $obsolete){
+            $oldKey=[string]$oldObject.Key
+            if([string]::IsNullOrWhiteSpace($oldKey)-or$oldKey-ceq$key){continue}
+            $deleteArgs=$aws+@(
+                "s3api","delete-object",
+                "--bucket",[string]$job.Bucket,
+                "--key",$oldKey
+            )
+            $deleteResult=Invoke-AwsNative -Arguments $deleteArgs
+            if($deleteResult.ExitCode -ne 0){
+                throw "Файл загружен, но не удалось удалить старый объект S3 '$oldKey': $($deleteResult.Output)"
+            }
+            $deletedByRetention++
+            Write-UploadLog "Retention deleted: $oldKey"
+        }
+    }
+
     $duration=[math]::Round($sw.Elapsed.TotalSeconds,1)
     $speed=if($duration -gt 0){[math]::Round(($item.Length/1MB)/$duration,2)}else{0}
 
-    Write-Status "FINISHED" 100 "Файл успешно загружен и проверен" $key $duration $speed (Get-Date).ToString("o") ([Int64]$item.Length) 0 "$speed MB/s"
+    $finishedMessage=if($deletedByRetention-gt0){
+        "Файл загружен; удалено старых объектов: $deletedByRetention"
+    }else{
+        "Файл успешно загружен и проверен"
+    }
+    Write-Status "FINISHED" 100 $finishedMessage $key $duration $speed (Get-Date).ToString("o") ([Int64]$item.Length) 0 "$speed MB/s"
 }
 catch{
     $parts=@()
