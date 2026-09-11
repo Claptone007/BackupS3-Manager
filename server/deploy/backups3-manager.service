@@ -1,0 +1,22 @@
+[Unit]
+Description=BackupS3 Manager Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backups3
+Group=backups3
+WorkingDirectory=/opt/backups3-manager
+EnvironmentFile=/etc/backups3-manager/server.env
+ExecStart=/opt/backups3-manager/BackupS3Manager.Server --urls=http://0.0.0.0:8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/backups3-manager
+
+[Install]
+WantedBy=multi-user.target

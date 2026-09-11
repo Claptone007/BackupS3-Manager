@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "PW2jaTVORIc=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\i.barkov\\Documents\\Codex\\2026-08-20\\e\\github\\BackupS3-Manager\\server\\BackupS3Manager.Server.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\i.barkov\\.nuget\\packages\\microsoft.net.illink.tasks\\8.0.30\\microsoft.net.illink.tasks.8.0.30.nupkg.sha512",
+    "C:\\Users\\i.barkov\\.nuget\\packages\\microsoft.netcore.app.runtime.linux-x64\\8.0.30\\microsoft.netcore.app.runtime.linux-x64.8.0.30.nupkg.sha512",
+    "C:\\Users\\i.barkov\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.linux-x64\\8.0.30\\microsoft.aspnetcore.app.runtime.linux-x64.8.0.30.nupkg.sha512",
+    "C:\\Users\\i.barkov\\.nuget\\packages\\microsoft.netcore.app.host.linux-x64\\8.0.30\\microsoft.netcore.app.host.linux-x64.8.0.30.nupkg.sha512"
+  ],
+  "logs": []
+}

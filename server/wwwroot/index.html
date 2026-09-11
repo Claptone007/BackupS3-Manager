@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BackupS3 Manager Server</title><link rel="stylesheet" href="/app.css"></head>
+<body>
+<header><div class="brand"><span class="logo">BS<span>3</span></span><div><h1>BackupS3 <b>SERVER</b></h1><p>Центральная консоль резервных копий</p></div></div><div class="header-actions"><span id="hostBadge" class="badge">Подключение…</span><button id="logout">Выйти</button></div></header>
+<main>
+  <section class="hero"><div><span class="eyebrow">BACKUPS3 MANAGER 25.0</span><h2>Все серверы и backup в одном месте</h2><p>Manager работает внутри Debian 13 LXC, а Windows-агенты сообщают состояние локальных копий.</p></div><div class="code-card"><small>Код подключения агента</small><strong id="enrollmentCode">••••••••••••</strong><button id="copyCode">Копировать</button></div></section>
+  <section class="metrics"><article><span>Агенты</span><strong id="agentsTotal">0</strong></article><article class="ok"><span>На связи</span><strong id="agentsOnline">0</strong></article><article class="bad"><span>Нет связи</span><strong id="agentsOffline">0</strong></article><article><span>Базы в отчётах</span><strong id="jobsTotal">0</strong></article></section>
+  <section class="panel"><div class="panel-title"><div><h3>Подключённые серверы</h3><p>Heartbeat обновляется автоматически каждые 15 секунд.</p></div><button id="refresh">↻ Обновить</button></div><div id="agents" class="agents"><div class="empty">Агенты ещё не подключены.</div></div></section>
+</main>
+<script src="/app.js"></script>
+</body></html>

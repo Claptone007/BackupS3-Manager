@@ -1,0 +1,37 @@
+{
+  "Files": [
+    {
+      "Id": "C:\\Users\\i.barkov\\Documents\\Codex\\2026-08-20\\e\\github\\BackupS3-Manager\\server\\wwwroot\\app.css",
+      "PackagePath": "staticwebassets\\app.css"
+    },
+    {
+      "Id": "C:\\Users\\i.barkov\\Documents\\Codex\\2026-08-20\\e\\github\\BackupS3-Manager\\server\\wwwroot\\app.js",
+      "PackagePath": "staticwebassets\\app.js"
+    },
+    {
+      "Id": "C:\\Users\\i.barkov\\Documents\\Codex\\2026-08-20\\e\\github\\BackupS3-Manager\\server\\wwwroot\\index.html",
+      "PackagePath": "staticwebassets\\index.html"
+    },
+    {
+      "Id": "C:\\Users\\i.barkov\\Documents\\Codex\\2026-08-20\\e\\github\\BackupS3-Manager\\server\\wwwroot\\login.html",
+      "PackagePath": "staticwebassets\\login.html"
+    },
+    {
+      "Id": "obj\\Release\\net8.0\\linux-x64\\staticwebassets\\msbuild.BackupS3Manager.Server.Microsoft.AspNetCore.StaticWebAssets.props",
+      "PackagePath": "build\\Microsoft.AspNetCore.StaticWebAssets.props"
+    },
+    {
+      "Id": "obj\\Release\\net8.0\\linux-x64\\staticwebassets\\msbuild.build.BackupS3Manager.Server.props",
+      "PackagePath": "build\\BackupS3Manager.Server.props"
+    },
+    {
+      "Id": "obj\\Release\\net8.0\\linux-x64\\staticwebassets\\msbuild.buildMultiTargeting.BackupS3Manager.Server.props",
+      "PackagePath": "buildMultiTargeting\\BackupS3Manager.Server.props"
+    },
+    {
+      "Id": "obj\\Release\\net8.0\\linux-x64\\staticwebassets\\msbuild.buildTransitive.BackupS3Manager.Server.props",
+      "PackagePath": "buildTransitive\\BackupS3Manager.Server.props"
+    }
+  ],
+  "ElementsToRemove": []
+}
