@@ -21,3 +21,5 @@ Import-LegacyData.ps1
 # .NET build outputs
 agent/bin/
 agent/obj/
+server/bin/
+server/obj/

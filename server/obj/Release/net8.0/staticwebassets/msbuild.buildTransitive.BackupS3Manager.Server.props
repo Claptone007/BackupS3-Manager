@@ -1,3 +1,0 @@
-﻿<Project>
-  <Import Project="..\buildMultiTargeting\BackupS3Manager.Server.props" />
-</Project>
